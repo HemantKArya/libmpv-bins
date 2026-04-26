@@ -24,40 +24,29 @@ jobs:
             /opt/hostedtoolcache /usr/local/share/boost
           df -h /
 
-      # ──────────────────────────────────────────────────────
-      # FIX: Ubuntu 22.04 ships meson 0.61.2.
-      # Modern libplacebo requires meson >= 1.3.0.
-      # Install newer meson + ninja via pip FIRST, then
-      # install the rest via apt. The pip versions will
-      # take priority in PATH.
-      # ──────────────────────────────────────────────────────
       - name: Install modern meson and ninja via pip
         run: |
-          # Remove system meson/ninja to avoid conflicts
           sudo apt-get remove -y meson ninja-build 2>/dev/null || true
-
-          # Install latest meson + ninja via pip
           python3 -m pip install --upgrade pip
           python3 -m pip install --upgrade meson ninja
+          echo "meson: $(meson --version)"
+          echo "ninja: $(ninja --version)"
 
-          # Verify versions
-          echo "=== Installed versions ==="
-          meson --version
-          ninja --version
-
-          # Confirm meson is >= 1.3.0
-          MESON_VER=$(meson --version)
-          echo "Meson version: $MESON_VER"
-          python3 -c "
-          import sys
-          parts = '$MESON_VER'.split('.')
-          major, minor = int(parts[0]), int(parts[1])
-          if major < 1 or (major == 1 and minor < 3):
-              print(f'FATAL: meson {\"$MESON_VER\"} < 1.3.0')
-              sys.exit(1)
-          print(f'OK: meson {\"$MESON_VER\"} >= 1.3.0')
-          "
-
+      # ──────────────────────────────────────────────────────
+      # FIX: Remove libvulkan-dev from the install list.
+      #
+      # The Vulkan header mismatch:
+      #   - libplacebo bundles Vulkan-Headers 1.4.x (via submodule)
+      #   - ffmpeg's hwcontext_vulkan.h uses VkVideoCodecOperationFlagBitsKHR
+      #     (requires Vulkan SDK >= 1.3.277)
+      #   - Ubuntu 22.04 libvulkan-dev has older headers (~1.3.204)
+      #   - When mpv compiles: includes libplacebo → ffmpeg vulkan header
+      #     → references a type that doesn't exist in the old system headers
+      #
+      # Since we build libmpv for OpenGL FBO rendering (not Vulkan),
+      # we don't need Vulkan at all. Removing libvulkan-dev prevents
+      # ffmpeg/libplacebo from detecting it, cleanly avoiding the issue.
+      # ──────────────────────────────────────────────────────
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -68,7 +57,7 @@ jobs:
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libxi-dev libxext-dev libxfixes-dev libxss-dev libxpresent-dev \
             libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev \
-            libdrm-dev libgbm-dev libvulkan-dev \
+            libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libjack-dev libpipewire-0.3-dev \
             libfreetype-dev libfontconfig1-dev libfribidi-dev \
             libharfbuzz-dev \
@@ -79,47 +68,63 @@ jobs:
             libbluray-dev libdvdnav-dev \
             python3 python3-pip python3-jinja2 python3-docutils
 
-          # Do NOT install meson or ninja-build from apt — we use pip versions
+          # Explicitly remove vulkan headers if somehow present
+          sudo apt-get remove -y libvulkan-dev 2>/dev/null || true
+
+          # NOTE: NO libvulkan-dev — avoids Vulkan header version mismatch
+          # NOTE: NO meson or ninja-build from apt — we use pip versions
 
       - name: Verify tool versions
         run: |
           echo "=== Tool versions ==="
-          echo "meson: $(meson --version)"
-          echo "ninja: $(ninja --version)"
+          echo "meson: $(meson --version) at $(which meson)"
+          echo "ninja: $(ninja --version) at $(which ninja)"
           echo "gcc:   $(gcc --version | head -1)"
           echo "nasm:  $(nasm --version)"
-          echo "pkg-config: $(pkg-config --version)"
-          which meson
-          which ninja
+          # Confirm no vulkan headers
+          echo ""
+          echo "=== Vulkan check ==="
+          pkg-config --modversion vulkan 2>/dev/null && echo "WARNING: vulkan found!" || echo "OK: vulkan not found (expected)"
 
       - name: Clone mpv-build
         run: |
           git clone --depth 1 "https://github.com/${MPV_BUILD_REPO}.git" mpv-build
 
+      # ──────────────────────────────────────────────────────
+      # Create ffmpeg_options to explicitly disable Vulkan.
+      # This is a belt-and-suspenders approach: even if somehow
+      # vulkan headers are found, ffmpeg won't try to use them.
+      #
+      # We do NOT use --enable-shared / --disable-static here.
+      # mpv-build's default behavior statically links ffmpeg
+      # into libmpv.so, which is what we want.
+      # ──────────────────────────────────────────────────────
       - name: Configure build options
         working-directory: mpv-build
         run: |
-          # mpv options: build shared libmpv, skip the player binary
+          # ffmpeg: disable vulkan, keep everything else default (static)
+          cat > ffmpeg_options <<'EOF'
+          --disable-vulkan
+          EOF
+
+          # mpv: build shared libmpv, no player binary
           cat > mpv_options <<'EOF'
           -Dlibmpv=true
           -Dbuild-date=false
           EOF
 
-          # Do NOT create ffmpeg_options — let mpv-build use defaults.
-          # Default = static linking of ffmpeg into libmpv.so
-          # This produces one self-contained .so with zero external deps.
-
+          echo "=== ffmpeg_options ==="
+          cat ffmpeg_options
+          echo ""
           echo "=== mpv_options ==="
           cat mpv_options
 
       - name: Build
         working-directory: mpv-build
         run: |
-          # Ensure pip-installed meson/ninja are found first
           export PATH="$HOME/.local/bin:$PATH"
           echo "Using meson: $(which meson) ($(meson --version))"
           echo "Using ninja: $(which ninja) ($(ninja --version))"
-
           ./rebuild -j$(nproc)
 
       - name: Collect and package
@@ -127,11 +132,10 @@ jobs:
           set -euo pipefail
           mkdir -p package/lib package/include/mpv
 
-          # ── Find libmpv.so ──
           echo "=== Searching for libmpv.so ==="
           find mpv-build -name 'libmpv*.so*' -type f 2>/dev/null | sort
 
-          # Search in all possible locations
+          # Search all possible locations
           for search_dir in \
             "mpv-build/mpv/build" \
             "mpv-build/build_libs/lib" \
@@ -141,14 +145,13 @@ jobs:
             fi
           done
 
-          # Check /usr/local (./rebuild might install system-wide)
+          # Check /usr/local
           if ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
-            if ls /usr/local/lib/libmpv.so* 1>/dev/null 2>&1; then
-              cp -a /usr/local/lib/libmpv*.so* package/lib/
-            fi
-            if ls /usr/local/lib/x86_64-linux-gnu/libmpv.so* 1>/dev/null 2>&1; then
-              cp -a /usr/local/lib/x86_64-linux-gnu/libmpv*.so* package/lib/
-            fi
+            for usrdir in /usr/local/lib /usr/local/lib/x86_64-linux-gnu; do
+              if ls "$usrdir"/libmpv.so* 1>/dev/null 2>&1; then
+                cp -a "$usrdir"/libmpv*.so* package/lib/
+              fi
+            done
           fi
 
           # ── Create proper symlinks ──
@@ -161,8 +164,6 @@ jobs:
             ln -sf "$BASENAME" "libmpv.so.${MAJOR}" 2>/dev/null || true
             ln -sf "libmpv.so.${MAJOR}" "libmpv.so" 2>/dev/null || true
             echo "Symlinks: libmpv.so -> libmpv.so.${MAJOR} -> ${BASENAME}"
-          elif [ -f "libmpv.so" ]; then
-            echo "Found libmpv.so directly"
           fi
 
           cd ../..
@@ -180,7 +181,6 @@ jobs:
             fi
           done
 
-          # Last resort: download from upstream
           if [ ! -f "package/include/mpv/client.h" ]; then
             echo "WARNING: Downloading headers from mpv repo..."
             for hdr in client.h render.h render_gl.h stream_cb.h; do
@@ -195,13 +195,8 @@ jobs:
 
           if ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
             echo "FATAL: libmpv.so not found!"
-            echo ""
-            echo "=== Full search of build tree ==="
             find mpv-build -name 'libmpv*' -type f 2>/dev/null
-            echo ""
-            echo "=== /usr/local/lib ==="
-            ls -la /usr/local/lib/libmpv* 2>/dev/null || echo "(nothing)"
-            ls -la /usr/local/lib/x86_64-linux-gnu/libmpv* 2>/dev/null || echo "(nothing)"
+            ls -la /usr/local/lib/libmpv* 2>/dev/null || true
             exit 1
           fi
 
@@ -227,6 +222,15 @@ jobs:
             readelf -d package/lib/libmpv.so | grep NEEDED || true
           fi
 
+          # Confirm no vulkan dependency
+          echo ""
+          echo "Vulkan check:"
+          if readelf -d package/lib/libmpv.so 2>/dev/null | grep -qi vulkan; then
+            echo "WARNING: libmpv has vulkan dependency (unexpected)"
+          else
+            echo "OK: no vulkan dependency"
+          fi
+
           echo ""
           echo "=== Libraries ==="
           ls -lh package/lib/
@@ -235,10 +239,8 @@ jobs:
           echo "=== Headers ==="
           ls -lh package/include/mpv/
 
-          # ── NOTICE ──
           cp NOTICE.md package/ 2>/dev/null || true
 
-          # ── Create deterministic tarball ──
           cd package
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \

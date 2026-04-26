@@ -44,11 +44,6 @@ jobs:
           echo "=== After cleanup ==="
           df -h /
 
-      # ──────────────────────────────────────────────────────
-      # FIX: Android SDK command-line tools (2024+) require Java 17.
-      # GitHub runners have multiple JDKs installed but default to 11.
-      # Use setup-java to guarantee Java 17 is active and JAVA_HOME is set.
-      # ──────────────────────────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -61,13 +56,33 @@ jobs:
           java -version
           javac -version
 
+      # ──────────────────────────────────────────────────────
+      # FIX: fontconfig now requires meson >= 1.6.1.
+      # Ubuntu 22.04 ships meson 0.61.2.
+      # Install modern meson via pip BEFORE apt meson,
+      # then remove the apt one so the pip version wins.
+      # ──────────────────────────────────────────────────────
+      - name: Install modern meson and ninja via pip
+        run: |
+          # Remove outdated system meson/ninja if present
+          sudo apt-get remove -y meson ninja-build 2>/dev/null || true
+
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade meson ninja
+
+          # Verify
+          echo "meson: $(meson --version)"
+          echo "ninja: $(ninja --version)"
+          echo "meson path: $(which meson)"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool pkg-config ninja-build \
+            autoconf automake libtool pkg-config \
             python3 python3-pip python3-setuptools python3-jsonschema \
-            nasm wget unzip meson git
+            nasm wget unzip git
+          # NOTE: meson and ninja are NOT installed from apt — we use pip versions
 
       - name: Clone mpv-android
         run: |
@@ -78,18 +93,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: mpv-android/buildscripts/sdk
-          key: android-sdk-ndk-${{ runner.os }}-v3
+          key: android-sdk-ndk-${{ runner.os }}-v4
 
       - name: Download sources and SDK
         working-directory: mpv-android/buildscripts
         run: |
-          # Verify Java 17 is active before SDK download
+          # Ensure pip-installed meson/ninja are in PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "Using meson: $(which meson) ($(meson --version))"
           java -version 2>&1 | head -1
           ./download.sh
 
       - name: Build for ${{ matrix.arch }}
         working-directory: mpv-android/buildscripts
         run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "Using meson: $(which meson) ($(meson --version))"
+
           if [ "${{ matrix.arch }}" = "armv7l" ]; then
             ./buildall.sh --clean mpv
           else
@@ -179,10 +199,8 @@ jobs:
           echo "=== Headers ==="
           ls -lh package/include/mpv/
 
-          # ── Add NOTICE ──
           cp NOTICE.md package/ 2>/dev/null || true
 
-          # ── Create deterministic tarball ──
           cd package
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \
@@ -195,7 +213,6 @@ jobs:
           ls -lh "../libmpv-android-${ABI}.tar.gz"
           sha256sum "../libmpv-android-${ABI}.tar.gz"
           echo ""
-          echo "=== Archive contents ==="
           tar -tzf "../libmpv-android-${ABI}.tar.gz"
 
       - uses: actions/upload-artifact@v4

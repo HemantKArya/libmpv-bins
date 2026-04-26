@@ -29,16 +29,20 @@ jobs:
           echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
 
       # ──────────────────────────────────────────────────────
-      # FIX: Use modern 7-Zip (7zz) instead of legacy p7zip (7z).
-      # p7zip-full on Ubuntu 22.04 is v16.02 (2016) and CANNOT
-      # decompress the LZMA2 methods used by shinchiro .7z files.
-      # The "7zip" package provides "7zz" — the official Linux
-      # port of 7-Zip by Igor Pavlov (v23.01+).
+      # Download official 7-Zip 24.08 directly.
+      # Ubuntu 22.04 apt versions are all too old:
+      #   p7zip-full = 16.02 (2016) — can't decompress LZMA2:96m
+      #   7zip       = 21.07 (2021) — can't decompress LZMA2:96m
+      # Need >= 23.01 for the methods shinchiro builds use.
       # ──────────────────────────────────────────────────────
-      - name: Install tools
+      - name: Install modern 7-Zip
         run: |
-          sudo apt-get update
-          sudo apt-get install -y 7zip
+          wget -q "https://www.7-zip.org/a/7z2408-linux-x64.tar.xz" -O /tmp/7z.tar.xz
+          sudo mkdir -p /opt/7zip
+          sudo tar -xf /tmp/7z.tar.xz -C /opt/7zip
+          sudo ln -sf /opt/7zip/7zz /usr/local/bin/7zz
+          rm /tmp/7z.tar.xz
+          echo "Installed: $(7zz --help 2>&1 | head -1)"
 
       - name: Download shinchiro dev build
         run: |
@@ -106,7 +110,6 @@ jobs:
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
 
-          # ── Use 7zz (modern 7-Zip), NOT 7z (legacy p7zip) ──
           7zz x mpv-dev.7z -ompv-dev-raw
 
           echo "=== Raw extraction contents ==="
@@ -156,13 +159,12 @@ jobs:
 
           if [ ! -f "package/bin/libmpv-2.dll" ] && [ ! -f "package/bin/mpv-2.dll" ]; then
             echo "FATAL: No DLL found (libmpv-2.dll or mpv-2.dll)"
-            echo "All files in content root:"
             find "$CONTENT_ROOT" -type f
             exit 1
           fi
 
           if [ ! -f "package/lib/libmpv.dll.a" ] && [ ! -f "package/lib/mpv.lib" ]; then
-            echo "FATAL: No import library found (libmpv.dll.a or mpv.lib)"
+            echo "FATAL: No import library found"
             exit 1
           fi
 
