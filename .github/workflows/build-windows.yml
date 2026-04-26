@@ -1,0 +1,158 @@
+name: Fetch Windows
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  windows:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            dev_pattern: "mpv-dev-x86_64-"
+            mpv_pattern: "mpv-x86_64-"
+          - arch: aarch64
+            dev_pattern: "mpv-dev-aarch64-"
+            mpv_pattern: "mpv-aarch64-"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -a; source config/versions.env; set +a
+          echo "SHINCHIRO_REPO=$SHINCHIRO_REPO" >> "$GITHUB_ENV"
+          echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
+
+      - name: Install 7z
+        run: sudo apt-get install -y p7zip-full
+
+      - name: Download shinchiro dev build
+        run: |
+          set -euo pipefail
+
+          # Get release JSON
+          if [ "$SHINCHIRO_TAG" = "latest" ]; then
+            API_URL="https://api.github.com/repos/${SHINCHIRO_REPO}/releases/latest"
+          else
+            API_URL="https://api.github.com/repos/${SHINCHIRO_REPO}/releases/tags/${SHINCHIRO_TAG}"
+          fi
+
+          echo "Fetching release info from: $API_URL"
+          RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
+
+          # Find the dev package URL for this architecture
+          # Pattern: mpv-dev-x86_64-YYYYMMDD-git-HASH.7z
+          # Exclude v3 builds (x86-64-v3 requires AVX2)
+          DEV_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          pattern = '${{ matrix.dev_pattern }}'
+          for asset in data.get('assets', []):
+              name = asset['name']
+              # Match pattern, must end with .7z, exclude v3 builds
+              if name.startswith(pattern) and name.endswith('.7z') and '-v3-' not in name:
+                  print(asset['browser_download_url'])
+                  break
+          " || true)
+
+          if [ -z "$DEV_URL" ]; then
+            echo "FATAL: Could not find dev package matching '${{ matrix.dev_pattern }}'"
+            echo "Available assets:"
+            echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for a in data.get('assets', []):
+              print(f\"  {a['name']}\")
+          "
+            exit 1
+          fi
+
+          echo "Downloading: $DEV_URL"
+          curl -L --fail --progress-bar -o mpv-dev.7z "$DEV_URL"
+          ls -lh mpv-dev.7z
+
+          # Also record the source URL for provenance
+          echo "$DEV_URL" > source-url.txt
+
+      - name: Extract and repackage
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.arch }}"
+
+          7z x mpv-dev.7z -ompv-dev-extracted
+
+          echo "=== Extracted contents ==="
+          find mpv-dev-extracted -type f | sort
+
+          mkdir -p package/lib package/bin package/include/mpv
+
+          # ── Headers ──
+          find mpv-dev-extracted -name '*.h' -path '*/mpv/*' \
+            -exec cp {} package/include/mpv/ \;
+          # Fallback: headers might be at top level
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            find mpv-dev-extracted -name 'client.h' -exec cp {} package/include/mpv/ \;
+            find mpv-dev-extracted -name 'render.h' -exec cp {} package/include/mpv/ \;
+            find mpv-dev-extracted -name 'render_gl.h' -exec cp {} package/include/mpv/ \;
+            find mpv-dev-extracted -name 'stream_cb.h' -exec cp {} package/include/mpv/ \;
+          fi
+
+          # ── Import library (.dll.a or .lib) ──
+          find mpv-dev-extracted -name 'libmpv.dll.a' -exec cp {} package/lib/ \; 2>/dev/null || true
+          find mpv-dev-extracted -name 'mpv.lib' -exec cp {} package/lib/ \; 2>/dev/null || true
+          find mpv-dev-extracted -name 'mpv.def' -exec cp {} package/lib/ \; 2>/dev/null || true
+
+          # ── DLL ──
+          find mpv-dev-extracted -name 'libmpv-2.dll' -exec cp {} package/bin/ \; 2>/dev/null || true
+          find mpv-dev-extracted -name 'mpv-2.dll' -exec cp {} package/bin/ \; 2>/dev/null || true
+
+          # ── Validate ──
+          echo "=== Package contents ==="
+          find package -type f | sort
+
+          HAS_DLL=false
+          [ -f "package/bin/libmpv-2.dll" ] && HAS_DLL=true
+          [ -f "package/bin/mpv-2.dll" ] && HAS_DLL=true
+
+          HAS_IMPLIB=false
+          [ -f "package/lib/libmpv.dll.a" ] && HAS_IMPLIB=true
+          [ -f "package/lib/mpv.lib" ] && HAS_IMPLIB=true
+
+          if [ "$HAS_DLL" = false ]; then
+            echo "FATAL: No DLL found (libmpv-2.dll or mpv-2.dll)"
+            exit 1
+          fi
+
+          for hdr in client.h render.h render_gl.h; do
+            if [ ! -f "package/include/mpv/$hdr" ]; then
+              echo "FATAL: Missing header: $hdr"
+              exit 1
+            fi
+          done
+
+          # ── Provenance ──
+          cp source-url.txt package/
+          cp NOTICE.md package/ 2>/dev/null || true
+
+          # ── Tarball ──
+          cd package
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../libmpv-windows-${ARCH}.tar.gz"
+
+          ls -lh "../libmpv-windows-${ARCH}.tar.gz"
+          sha256sum "../libmpv-windows-${ARCH}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-windows-${{ matrix.arch }}
+          path: libmpv-windows-${{ matrix.arch }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error

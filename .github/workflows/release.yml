@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 2026.04.26)'
+        required: true
+        type: string
+      skip_android:
+        description: 'Skip Android build (use existing artifacts)'
+        required: false
+        type: boolean
+        default: false
+      skip_linux:
+        description: 'Skip Linux build'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ══════════════════════════════════════
+  # 1. Build / Fetch all platforms
+  # ══════════════════════════════════════
+  build-android:
+    if: ${{ !inputs.skip_android }}
+    uses: ./.github/workflows/build-android.yml
+
+  build-linux:
+    if: ${{ !inputs.skip_linux }}
+    uses: ./.github/workflows/build-linux.yml
+
+  fetch-windows:
+    uses: ./.github/workflows/fetch-windows.yml
+
+  fetch-darwin:
+    uses: ./.github/workflows/fetch-darwin.yml
+
+  # ══════════════════════════════════════
+  # 2. Collect and release
+  # ══════════════════════════════════════
+  release:
+    needs: [build-android, build-linux, fetch-windows, fetch-darwin]
+    if: always() && !cancelled()
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ALL artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect tarballs and generate checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          echo "=== All artifacts ==="
+          find artifacts/ -type f -name '*.tar.gz' | sort
+
+          # Flatten all .tar.gz into release/
+          find artifacts/ -name '*.tar.gz' -exec cp {} release/ \;
+
+          echo ""
+          echo "=== Release contents ==="
+          ls -lh release/
+
+          # Count what we got
+          TOTAL=$(ls release/*.tar.gz 2>/dev/null | wc -l)
+          echo "Total archives: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "FATAL: No archives collected!"
+            exit 1
+          fi
+
+          # Generate checksums
+          cd release
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS.txt
+
+          echo ""
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS.txt
+
+      - name: Generate release body
+        run: |
+          VERSION="${{ inputs.version }}"
+          cat > release/RELEASE_NOTES.md <<EOF
+          ## libmpv prebuilt binaries v${VERSION}
+
+          Built and packaged automatically via GitHub Actions.
+
+          ### Available Archives
+
+          | Platform | Architecture | Archive | Verified |
+          |----------|-------------|---------|----------|
+          EOF
+
+          for f in release/libmpv-*.tar.gz; do
+            BASENAME=$(basename "$f")
+            SIZE=$(du -h "$f" | cut -f1)
+            # Parse: libmpv-{platform}-{arch}.tar.gz
+            PARTS=$(echo "$BASENAME" | sed 's/libmpv-//;s/.tar.gz//')
+            PLATFORM=$(echo "$PARTS" | rev | cut -d- -f2- | rev)
+            ARCH=$(echo "$PARTS" | rev | cut -d- -f1 | rev)
+
+            echo "| ${PLATFORM} | ${ARCH} | \`${BASENAME}\` (${SIZE}) | ✓ |" >> release/RELEASE_NOTES.md
+          done
+
+          cat >> release/RELEASE_NOTES.md <<'EOF'
+
+          ### Sources
+
+          | Platform | Source |
+          |----------|--------|
+          | Android | Compiled from [mpv-android](https://github.com/mpv-android/mpv-android) buildscripts |
+          | Linux | Compiled from [mpv-build](https://github.com/mpv-player/mpv-build) |
+          | Windows | Repackaged from [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) |
+          | macOS/iOS | Repackaged from [media-kit/libmpv-darwin-build](https://github.com/media-kit/libmpv-darwin-build) |
+
+          ### Verification
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+
+          ### Archive Structure
+          Every archive has this layout:
+          ```
+          lib/              # .so / .dll / .dylib / .a / .framework
+          include/mpv/      # client.h, render.h, render_gl.h, stream_cb.h
+          NOTICE.md         # License attribution
+          ```
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ inputs.version }}"
+          name: "v${{ inputs.version }}"
+          body_path: release/RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: |
+            release/libmpv-*.tar.gz
+            release/SHA256SUMS.txt

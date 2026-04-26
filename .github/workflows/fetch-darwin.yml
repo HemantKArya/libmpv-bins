@@ -1,0 +1,159 @@
+name: Fetch Darwin (macOS + iOS)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  darwin:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS
+          - platform: macos
+            arch: arm64
+            source_pattern: "macos-arm64-video-default"
+          - platform: macos
+            arch: x86_64
+            source_pattern: "macos-amd64-video-default"
+          # iOS device
+          - platform: ios
+            arch: arm64
+            source_pattern: "ios-arm64-video-default"
+          # iOS simulator
+          - platform: iossimulator
+            arch: arm64
+            source_pattern: "iossimulator-arm64-video-default"
+          - platform: iossimulator
+            arch: x86_64
+            source_pattern: "iossimulator-amd64-video-default"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -a; source config/versions.env; set +a
+          echo "DARWIN_REPO=$DARWIN_REPO" >> "$GITHUB_ENV"
+          echo "DARWIN_TAG=$DARWIN_TAG" >> "$GITHUB_ENV"
+
+      - name: Download media-kit darwin build
+        run: |
+          set -euo pipefail
+
+          API_URL="https://api.github.com/repos/${DARWIN_REPO}/releases/tags/${DARWIN_TAG}"
+          echo "Fetching: $API_URL"
+          RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
+
+          # Find matching asset
+          PATTERN="${{ matrix.source_pattern }}"
+          ASSET_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          pattern = '${PATTERN}'
+          for asset in data.get('assets', []):
+              name = asset['name']
+              if pattern in name and name.endswith('.tar.gz'):
+                  print(asset['browser_download_url'])
+                  break
+          " || true)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "FATAL: No asset matching pattern '${PATTERN}'"
+            echo "Available assets:"
+            echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for a in data.get('assets', []):
+              print(f\"  {a['name']}\")
+          "
+            exit 1
+          fi
+
+          echo "Downloading: $ASSET_URL"
+          curl -L --fail --progress-bar -o darwin-source.tar.gz "$ASSET_URL"
+          echo "$ASSET_URL" > source-url.txt
+
+      - name: Extract and repackage
+        run: |
+          set -euo pipefail
+          PLATFORM="${{ matrix.platform }}"
+          ARCH="${{ matrix.arch }}"
+
+          mkdir -p extracted
+          tar -xzf darwin-source.tar.gz -C extracted
+
+          echo "=== Extracted contents ==="
+          find extracted -type f | head -50
+
+          mkdir -p package/lib package/include/mpv
+
+          # ── Libraries (.dylib, .a, .framework) ──
+          # media-kit builds produce .xcframework or .framework directories
+          # and/or static .a files
+          find extracted -name '*.dylib' -exec cp -a {} package/lib/ \; 2>/dev/null || true
+          find extracted -name '*.a' -exec cp -a {} package/lib/ \; 2>/dev/null || true
+
+          # Copy frameworks if present
+          if find extracted -name '*.framework' -type d | grep -q .; then
+            mkdir -p package/Frameworks
+            find extracted -name '*.framework' -type d -exec cp -a {} package/Frameworks/ \;
+          fi
+
+          # ── Headers ──
+          find extracted -name 'client.h' -path '*/mpv/*' \
+            -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+          find extracted -name 'render.h' -path '*/mpv/*' \
+            -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+          find extracted -name 'render_gl.h' -path '*/mpv/*' \
+            -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+          find extracted -name 'stream_cb.h' -path '*/mpv/*' \
+            -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+
+          # If no headers found in archive, they might need separate download
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            echo "WARNING: Headers not found in archive, downloading from mpv repo"
+            for hdr in client.h render.h render_gl.h stream_cb.h; do
+              curl -sL "https://raw.githubusercontent.com/mpv-player/mpv/master/libmpv/${hdr}" \
+                -o "package/include/mpv/${hdr}" || true
+            done
+          fi
+
+          # ── Validate ──
+          echo "=== Package structure ==="
+          find package -type f | sort
+
+          HAS_LIBS=false
+          [ "$(find package/lib -type f 2>/dev/null | wc -l)" -gt 0 ] && HAS_LIBS=true
+          [ -d "package/Frameworks" ] && HAS_LIBS=true
+
+          if [ "$HAS_LIBS" = false ]; then
+            echo "FATAL: No libraries found"
+            exit 1
+          fi
+
+          # ── Provenance ──
+          cp source-url.txt package/
+          cp NOTICE.md package/ 2>/dev/null || true
+
+          # ── Tarball ──
+          OUTPUT_NAME="libmpv-${PLATFORM}-${ARCH}"
+          cd package
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../${OUTPUT_NAME}.tar.gz"
+
+          ls -lh "../${OUTPUT_NAME}.tar.gz"
+          sha256sum "../${OUTPUT_NAME}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-${{ matrix.platform }}-${{ matrix.arch }}
+          path: libmpv-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error

@@ -1,0 +1,153 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            abi: arm64-v8a
+          - arch: armv7l
+            abi: armeabi-v7a
+          - arch: x86_64
+            abi: x86_64
+          - arch: x86
+            abi: x86
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -a
+          source config/versions.env
+          set +a
+          echo "MPV_ANDROID_REPO=$MPV_ANDROID_REPO" >> "$GITHUB_ENV"
+          echo "MPV_ANDROID_REF=$MPV_ANDROID_REF" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config ninja-build \
+            python3 python3-pip python3-setuptools python3-jsonschema \
+            nasm wget unzip meson git openjdk-17-jdk-headless
+
+      - name: Clone mpv-android
+        run: |
+          git clone --depth 1 --branch "$MPV_ANDROID_REF" \
+            "https://github.com/${MPV_ANDROID_REPO}.git" mpv-android
+
+      - name: Cache Android SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: mpv-android/buildscripts/sdk
+          key: android-sdk-ndk-${{ runner.os }}-v3
+
+      - name: Download sources and SDK
+        working-directory: mpv-android/buildscripts
+        run: |
+          ./download.sh
+
+      - name: Build for ${{ matrix.arch }}
+        working-directory: mpv-android/buildscripts
+        run: |
+          if [ "${{ matrix.arch }}" = "armv7l" ]; then
+            ./buildall.sh --clean
+          else
+            ./buildall.sh --arch ${{ matrix.arch }} --clean
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.arch }}"
+          ABI="${{ matrix.abi }}"
+          PREFIX="mpv-android/buildscripts/prefix/${ARCH}"
+
+          mkdir -p package/lib package/include/mpv
+
+          # ── Collect .so files ──
+          if [ -d "${PREFIX}/lib" ]; then
+            find "${PREFIX}/lib" -name '*.so' -exec cp {} package/lib/ \;
+          fi
+
+          # ── Collect headers ──
+          # Try installed headers first
+          if [ -d "${PREFIX}/include/mpv" ]; then
+            cp "${PREFIX}/include/mpv"/*.h package/include/mpv/
+          fi
+
+          # Fallback: find headers in source tree
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            for header in client.h render.h render_gl.h stream_cb.h; do
+              find mpv-android -name "$header" -path "*/include/mpv/*" \
+                -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+            done
+          fi
+
+          # ── Validate ──
+          echo "=== Validating package ==="
+
+          REQUIRED_LIBS=(libmpv.so)
+          for lib in "${REQUIRED_LIBS[@]}"; do
+            if [ ! -f "package/lib/$lib" ]; then
+              echo "FATAL: Missing required library: $lib"
+              ls -la package/lib/
+              exit 1
+            fi
+          done
+
+          REQUIRED_HEADERS=(client.h render.h render_gl.h)
+          for hdr in "${REQUIRED_HEADERS[@]}"; do
+            if [ ! -f "package/include/mpv/$hdr" ]; then
+              echo "FATAL: Missing required header: $hdr"
+              ls -la package/include/mpv/
+              exit 1
+            fi
+          done
+
+          # ── Verify architecture ──
+          file package/lib/libmpv.so
+          readelf -h package/lib/libmpv.so | grep Machine
+
+          # ── Add NOTICE ──
+          cp NOTICE.md package/ 2>/dev/null || true
+
+          # ── Create deterministic tarball ──
+          cd package
+          # Sort files, zero timestamps for reproducibility
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../libmpv-android-${ABI}.tar.gz"
+
+          echo "=== Archive info ==="
+          ls -lh "../libmpv-android-${ABI}.tar.gz"
+          sha256sum "../libmpv-android-${ABI}.tar.gz"
+
+          echo "=== Contents ==="
+          tar -tzf "../libmpv-android-${ABI}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-android-${{ matrix.abi }}
+          path: libmpv-android-${{ matrix.abi }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error
