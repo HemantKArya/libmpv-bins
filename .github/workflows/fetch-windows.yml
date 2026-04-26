@@ -14,10 +14,10 @@ jobs:
         include:
           - arch: x86_64
             dev_pattern: "mpv-dev-x86_64-"
-            mpv_pattern: "mpv-x86_64-"
+            exclude_patterns: "-v3-,-gcc-"
           - arch: aarch64
             dev_pattern: "mpv-dev-aarch64-"
-            mpv_pattern: "mpv-aarch64-"
+            exclude_patterns: "-gcc-"
 
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +28,13 @@ jobs:
           echo "SHINCHIRO_REPO=$SHINCHIRO_REPO" >> "$GITHUB_ENV"
           echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
 
-      - name: Install 7z
+      - name: Install tools
         run: sudo apt-get install -y p7zip-full
 
       - name: Download shinchiro dev build
         run: |
           set -euo pipefail
 
-          # Get release JSON
           if [ "$SHINCHIRO_TAG" = "latest" ]; then
             API_URL="https://api.github.com/repos/${SHINCHIRO_REPO}/releases/latest"
           else
@@ -45,23 +44,38 @@ jobs:
           echo "Fetching release info from: $API_URL"
           RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
 
-          # Find the dev package URL for this architecture
-          # Pattern: mpv-dev-x86_64-YYYYMMDD-git-HASH.7z
-          # Exclude v3 builds (x86-64-v3 requires AVX2)
+          # ──────────────────────────────────────────────────────
+          # FIX BUG #3 & #8: Improved asset matching.
+          # Actual asset names: mpv-dev-x86_64-20260421-git-5921fe5.7z
+          # Must exclude: -v3- (AVX2 build), -gcc- (GCC variant)
+          # ──────────────────────────────────────────────────────
           DEV_URL=$(echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           pattern = '${{ matrix.dev_pattern }}'
+          excludes = '${{ matrix.exclude_patterns }}'.split(',')
           for asset in data.get('assets', []):
               name = asset['name']
-              # Match pattern, must end with .7z, exclude v3 builds
-              if name.startswith(pattern) and name.endswith('.7z') and '-v3-' not in name:
-                  print(asset['browser_download_url'])
-                  break
+              if not name.startswith(pattern):
+                  continue
+              if not name.endswith('.7z'):
+                  continue
+              # Skip excluded variants
+              skip = False
+              for excl in excludes:
+                  excl = excl.strip()
+                  if excl and excl in name:
+                      skip = True
+                      break
+              if skip:
+                  continue
+              print(asset['browser_download_url'])
+              break
           " || true)
 
           if [ -z "$DEV_URL" ]; then
             echo "FATAL: Could not find dev package matching '${{ matrix.dev_pattern }}'"
+            echo ""
             echo "Available assets:"
             echo "$RELEASE_JSON" | python3 -c "
           import sys, json
@@ -76,58 +90,96 @@ jobs:
           curl -L --fail --progress-bar -o mpv-dev.7z "$DEV_URL"
           ls -lh mpv-dev.7z
 
-          # Also record the source URL for provenance
+          # Record source URL for provenance
           echo "$DEV_URL" > source-url.txt
 
+          # Also record the release tag
+          echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print(data.get('tag_name', 'unknown'))
+          " > source-tag.txt
+
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #4: 7z extracts into a named subdirectory like
+      # mpv-dev-x86_64-20260421-git-5921fe5/
+      # Must handle this nesting properly.
+      # ──────────────────────────────────────────────────────
       - name: Extract and repackage
         run: |
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
 
-          7z x mpv-dev.7z -ompv-dev-extracted
+          7z x mpv-dev.7z -ompv-dev-raw
 
-          echo "=== Extracted contents ==="
-          find mpv-dev-extracted -type f | sort
+          echo "=== Raw extraction contents ==="
+          find mpv-dev-raw -type f | sort
+
+          # Find the actual content root.
+          # 7z might extract into a subdirectory, or directly into mpv-dev-raw.
+          # Detect by looking for where client.h lives.
+          CONTENT_ROOT=$(find mpv-dev-raw -name 'client.h' -printf '%h\n' | head -1)
+          if [ -n "$CONTENT_ROOT" ]; then
+            # client.h is in .../include/mpv/ — go up to the package root
+            # e.g. mpv-dev-raw/mpv-dev-x86_64-.../include/mpv → mpv-dev-raw/mpv-dev-x86_64-...
+            CONTENT_ROOT=$(echo "$CONTENT_ROOT" | sed 's|/include/mpv$||')
+          else
+            # Fallback: use the first subdirectory
+            CONTENT_ROOT=$(find mpv-dev-raw -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ -z "$CONTENT_ROOT" ]; then
+              CONTENT_ROOT="mpv-dev-raw"
+            fi
+          fi
+
+          echo "Content root: $CONTENT_ROOT"
+          echo ""
+          echo "=== Content root files ==="
+          find "$CONTENT_ROOT" -type f | sort
 
           mkdir -p package/lib package/bin package/include/mpv
 
           # ── Headers ──
-          find mpv-dev-extracted -name '*.h' -path '*/mpv/*' \
-            -exec cp {} package/include/mpv/ \;
-          # Fallback: headers might be at top level
-          if [ ! -f "package/include/mpv/client.h" ]; then
-            find mpv-dev-extracted -name 'client.h' -exec cp {} package/include/mpv/ \;
-            find mpv-dev-extracted -name 'render.h' -exec cp {} package/include/mpv/ \;
-            find mpv-dev-extracted -name 'render_gl.h' -exec cp {} package/include/mpv/ \;
-            find mpv-dev-extracted -name 'stream_cb.h' -exec cp {} package/include/mpv/ \;
+          # shinchiro dev packages have include/mpv/{client.h, render.h, render_gl.h, stream_cb.h}
+          if [ -d "$CONTENT_ROOT/include/mpv" ]; then
+            cp "$CONTENT_ROOT/include/mpv"/*.h package/include/mpv/
+          else
+            find "$CONTENT_ROOT" -name '*.h' | while read -r hdr; do
+              cp "$hdr" package/include/mpv/
+            done
           fi
 
-          # ── Import library (.dll.a or .lib) ──
-          find mpv-dev-extracted -name 'libmpv.dll.a' -exec cp {} package/lib/ \; 2>/dev/null || true
-          find mpv-dev-extracted -name 'mpv.lib' -exec cp {} package/lib/ \; 2>/dev/null || true
-          find mpv-dev-extracted -name 'mpv.def' -exec cp {} package/lib/ \; 2>/dev/null || true
-
           # ── DLL ──
-          find mpv-dev-extracted -name 'libmpv-2.dll' -exec cp {} package/bin/ \; 2>/dev/null || true
-          find mpv-dev-extracted -name 'mpv-2.dll' -exec cp {} package/bin/ \; 2>/dev/null || true
+          # shinchiro names it libmpv-2.dll
+          find "$CONTENT_ROOT" -name 'libmpv-2.dll' -type f -exec cp {} package/bin/ \;
+          # Fallback name
+          if [ ! -f "package/bin/libmpv-2.dll" ]; then
+            find "$CONTENT_ROOT" -name 'mpv-2.dll' -type f -exec cp {} package/bin/ \;
+          fi
+
+          # ── Import library ──
+          find "$CONTENT_ROOT" -name 'libmpv.dll.a' -type f -exec cp {} package/lib/ \;
+          find "$CONTENT_ROOT" -name 'mpv.lib' -type f -exec cp {} package/lib/ \; 2>/dev/null || true
+          find "$CONTENT_ROOT" -name '*.def' -type f -exec cp {} package/lib/ \; 2>/dev/null || true
 
           # ── Validate ──
-          echo "=== Package contents ==="
-          find package -type f | sort
+          echo ""
+          echo "=== Validation ==="
 
-          HAS_DLL=false
-          [ -f "package/bin/libmpv-2.dll" ] && HAS_DLL=true
-          [ -f "package/bin/mpv-2.dll" ] && HAS_DLL=true
-
-          HAS_IMPLIB=false
-          [ -f "package/lib/libmpv.dll.a" ] && HAS_IMPLIB=true
-          [ -f "package/lib/mpv.lib" ] && HAS_IMPLIB=true
-
-          if [ "$HAS_DLL" = false ]; then
+          # Must have DLL
+          if [ ! -f "package/bin/libmpv-2.dll" ] && [ ! -f "package/bin/mpv-2.dll" ]; then
             echo "FATAL: No DLL found (libmpv-2.dll or mpv-2.dll)"
+            echo "All files in content root:"
+            find "$CONTENT_ROOT" -type f
             exit 1
           fi
 
+          # Must have import library
+          if [ ! -f "package/lib/libmpv.dll.a" ] && [ ! -f "package/lib/mpv.lib" ]; then
+            echo "FATAL: No import library found (libmpv.dll.a or mpv.lib)"
+            exit 1
+          fi
+
+          # Must have headers
           for hdr in client.h render.h render_gl.h; do
             if [ ! -f "package/include/mpv/$hdr" ]; then
               echo "FATAL: Missing header: $hdr"
@@ -135,8 +187,16 @@ jobs:
             fi
           done
 
+          echo "DLL:"
+          ls -lh package/bin/
+          echo "Import lib:"
+          ls -lh package/lib/
+          echo "Headers:"
+          ls -lh package/include/mpv/
+
           # ── Provenance ──
           cp source-url.txt package/
+          cp source-tag.txt package/ 2>/dev/null || true
           cp NOTICE.md package/ 2>/dev/null || true
 
           # ── Tarball ──
@@ -147,6 +207,8 @@ jobs:
                 --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
             | gzip -9n > "../libmpv-windows-${ARCH}.tar.gz"
 
+          echo ""
+          echo "=== Final archive ==="
           ls -lh "../libmpv-windows-${ARCH}.tar.gz"
           sha256sum "../libmpv-windows-${ARCH}.tar.gz"
 

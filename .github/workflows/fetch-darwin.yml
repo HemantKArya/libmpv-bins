@@ -12,24 +12,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ──────────────────────────────────────────────────────
+          # media-kit asset naming convention:
+          #   libmpv-libs_v{VERSION}_{platform}-{arch}-video-default.tar.gz
+          #
+          # Note: media-kit uses "amd64" not "x86_64"
+          # ──────────────────────────────────────────────────────
           # macOS
           - platform: macos
             arch: arm64
             source_pattern: "macos-arm64-video-default"
+            output_arch: arm64
           - platform: macos
-            arch: x86_64
+            arch: amd64
             source_pattern: "macos-amd64-video-default"
+            output_arch: x86_64
           # iOS device
           - platform: ios
             arch: arm64
             source_pattern: "ios-arm64-video-default"
+            output_arch: arm64
           # iOS simulator
           - platform: iossimulator
             arch: arm64
             source_pattern: "iossimulator-arm64-video-default"
+            output_arch: arm64
           - platform: iossimulator
-            arch: x86_64
+            arch: amd64
             source_pattern: "iossimulator-amd64-video-default"
+            output_arch: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +59,10 @@ jobs:
           echo "Fetching: $API_URL"
           RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
 
-          # Find matching asset
           PATTERN="${{ matrix.source_pattern }}"
-          ASSET_URL=$(echo "$RELEASE_JSON" | python3 -c "
+
+          # Find the asset whose name contains our pattern and ends with .tar.gz
+          ASSET_INFO=$(echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           pattern = '${PATTERN}'
@@ -58,52 +70,64 @@ jobs:
               name = asset['name']
               if pattern in name and name.endswith('.tar.gz'):
                   print(asset['browser_download_url'])
+                  print(name)
                   break
           " || true)
 
+          ASSET_URL=$(echo "$ASSET_INFO" | head -1)
+          ASSET_NAME=$(echo "$ASSET_INFO" | tail -1)
+
           if [ -z "$ASSET_URL" ]; then
             echo "FATAL: No asset matching pattern '${PATTERN}'"
+            echo ""
             echo "Available assets:"
             echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           for a in data.get('assets', []):
               print(f\"  {a['name']}\")
-          "
+          " | sort
             exit 1
           fi
 
           echo "Downloading: $ASSET_URL"
+          echo "Asset name: $ASSET_NAME"
           curl -L --fail --progress-bar -o darwin-source.tar.gz "$ASSET_URL"
+
           echo "$ASSET_URL" > source-url.txt
+          echo "$ASSET_NAME" > source-asset.txt
 
       - name: Extract and repackage
         run: |
           set -euo pipefail
           PLATFORM="${{ matrix.platform }}"
-          ARCH="${{ matrix.arch }}"
+          OUTPUT_ARCH="${{ matrix.output_arch }}"
 
           mkdir -p extracted
           tar -xzf darwin-source.tar.gz -C extracted
 
           echo "=== Extracted contents ==="
-          find extracted -type f | head -50
+          find extracted -type f | head -80
 
           mkdir -p package/lib package/include/mpv
 
-          # ── Libraries (.dylib, .a, .framework) ──
-          # media-kit builds produce .xcframework or .framework directories
-          # and/or static .a files
+          # ── Libraries ──
+          # media-kit builds produce various formats depending on platform:
+          #   macOS: .dylib files
+          #   iOS: .a (static) or .framework bundles
           find extracted -name '*.dylib' -exec cp -a {} package/lib/ \; 2>/dev/null || true
           find extracted -name '*.a' -exec cp -a {} package/lib/ \; 2>/dev/null || true
 
-          # Copy frameworks if present
-          if find extracted -name '*.framework' -type d | grep -q .; then
+          # Copy .framework bundles if present
+          FOUND_FRAMEWORK=false
+          while IFS= read -r -d '' fw; do
             mkdir -p package/Frameworks
-            find extracted -name '*.framework' -type d -exec cp -a {} package/Frameworks/ \;
-          fi
+            cp -a "$fw" package/Frameworks/
+            FOUND_FRAMEWORK=true
+          done < <(find extracted -name '*.framework' -type d -print0 2>/dev/null)
 
           # ── Headers ──
+          # Try to find mpv headers in the extracted archive
           find extracted -name 'client.h' -path '*/mpv/*' \
             -exec cp {} package/include/mpv/ \; 2>/dev/null || true
           find extracted -name 'render.h' -path '*/mpv/*' \
@@ -113,7 +137,19 @@ jobs:
           find extracted -name 'stream_cb.h' -path '*/mpv/*' \
             -exec cp {} package/include/mpv/ \; 2>/dev/null || true
 
-          # If no headers found in archive, they might need separate download
+          # Also look inside frameworks for headers
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            find extracted -name 'client.h' \
+              -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+            find extracted -name 'render.h' -not -path '*/OpenGL/*' \
+              -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+            find extracted -name 'render_gl.h' \
+              -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+            find extracted -name 'stream_cb.h' \
+              -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+          fi
+
+          # Last resort: download from upstream mpv repo
           if [ ! -f "package/include/mpv/client.h" ]; then
             echo "WARNING: Headers not found in archive, downloading from mpv repo"
             for hdr in client.h render.h render_gl.h stream_cb.h; do
@@ -123,24 +159,36 @@ jobs:
           fi
 
           # ── Validate ──
-          echo "=== Package structure ==="
-          find package -type f | sort
+          echo ""
+          echo "=== Validation ==="
 
           HAS_LIBS=false
-          [ "$(find package/lib -type f 2>/dev/null | wc -l)" -gt 0 ] && HAS_LIBS=true
-          [ -d "package/Frameworks" ] && HAS_LIBS=true
+          LIB_COUNT=$(find package/lib -type f 2>/dev/null | wc -l)
+          [ "$LIB_COUNT" -gt 0 ] && HAS_LIBS=true
+          [ "$FOUND_FRAMEWORK" = true ] && HAS_LIBS=true
 
           if [ "$HAS_LIBS" = false ]; then
-            echo "FATAL: No libraries found"
+            echo "FATAL: No libraries or frameworks found"
+            echo ""
+            echo "Full extraction tree:"
+            find extracted -type f
             exit 1
           fi
 
+          echo "Libraries:"
+          find package/lib -type f -exec ls -lh {} \; 2>/dev/null || true
+          echo "Frameworks:"
+          find package/Frameworks -type d -maxdepth 1 2>/dev/null || echo "(none)"
+          echo "Headers:"
+          ls -lh package/include/mpv/ 2>/dev/null || echo "(none)"
+
           # ── Provenance ──
           cp source-url.txt package/
+          cp source-asset.txt package/ 2>/dev/null || true
           cp NOTICE.md package/ 2>/dev/null || true
 
           # ── Tarball ──
-          OUTPUT_NAME="libmpv-${PLATFORM}-${ARCH}"
+          OUTPUT_NAME="libmpv-${PLATFORM}-${OUTPUT_ARCH}"
           cd package
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \
@@ -148,12 +196,14 @@ jobs:
                 --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
             | gzip -9n > "../${OUTPUT_NAME}.tar.gz"
 
+          echo ""
+          echo "=== Final archive ==="
           ls -lh "../${OUTPUT_NAME}.tar.gz"
           sha256sum "../${OUTPUT_NAME}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: libmpv-${{ matrix.platform }}-${{ matrix.arch }}
-          path: libmpv-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          name: libmpv-${{ matrix.platform }}-${{ matrix.output_arch }}
+          path: libmpv-${{ matrix.platform }}-${{ matrix.output_arch }}.tar.gz
           retention-days: 5
           if-no-files-found: error

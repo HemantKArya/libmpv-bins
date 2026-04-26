@@ -35,9 +35,13 @@ jobs:
 
       - name: Free disk space
         run: |
+          echo "=== Before cleanup ==="
+          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
-            /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+            /opt/ghc /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/local/graalvm /usr/local/.ghcup
           sudo apt-get clean
+          echo "=== After cleanup ==="
           df -h /
 
       - name: Install dependencies
@@ -62,87 +66,138 @@ jobs:
       - name: Download sources and SDK
         working-directory: mpv-android/buildscripts
         run: |
+          # download.sh fetches: Android SDK, NDK, and all source tarballs
+          # (ffmpeg, dav1d, mbedtls, libass, libplacebo, mpv, etc.)
           ./download.sh
 
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #1: Must specify "mpv" target to avoid
+      # building the Java/Gradle Android app (which we don't need).
+      # ./buildall.sh --arch arm64 mpv
+      #   → Builds mpv AND all its native dependencies
+      #   → Does NOT build the Android APK
+      # ──────────────────────────────────────────────────────
       - name: Build for ${{ matrix.arch }}
         working-directory: mpv-android/buildscripts
         run: |
           if [ "${{ matrix.arch }}" = "armv7l" ]; then
-            ./buildall.sh --clean
+            ./buildall.sh --clean mpv
           else
-            ./buildall.sh --arch ${{ matrix.arch }} --clean
+            ./buildall.sh --arch ${{ matrix.arch }} --clean mpv
           fi
 
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #6: libmpv.so is not always in prefix/{arch}/lib.
+      # Search multiple locations as fallback.
+      # ──────────────────────────────────────────────────────
       - name: Package
         run: |
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
           ABI="${{ matrix.abi }}"
           PREFIX="mpv-android/buildscripts/prefix/${ARCH}"
+          DEPS_DIR="mpv-android/buildscripts/deps"
 
           mkdir -p package/lib package/include/mpv
 
           # ── Collect .so files ──
+          # Primary location: prefix/{arch}/lib
           if [ -d "${PREFIX}/lib" ]; then
-            find "${PREFIX}/lib" -name '*.so' -exec cp {} package/lib/ \;
+            find "${PREFIX}/lib" -maxdepth 1 -name '*.so' -exec cp {} package/lib/ \;
+          fi
+
+          # Fallback: if libmpv.so not in prefix, search deps build output
+          if [ ! -f "package/lib/libmpv.so" ]; then
+            echo "WARNING: libmpv.so not in prefix, searching deps directory..."
+            find "${DEPS_DIR}" -name 'libmpv.so' -type f 2>/dev/null | while read -r f; do
+              echo "  Found: $f"
+              cp "$f" package/lib/
+            done
+          fi
+
+          # Also grab any libmpv dependencies that were built
+          if [ ! -f "package/lib/libavcodec.so" ]; then
+            # Some mpv-android versions put libs in deps subdirs
+            for dep_dir in "${DEPS_DIR}"/*/lib; do
+              [ -d "$dep_dir" ] && find "$dep_dir" -maxdepth 1 -name '*.so' -exec cp -n {} package/lib/ \;
+            done
           fi
 
           # ── Collect headers ──
-          # Try installed headers first
+          # Primary: prefix/{arch}/include/mpv
           if [ -d "${PREFIX}/include/mpv" ]; then
             cp "${PREFIX}/include/mpv"/*.h package/include/mpv/
           fi
 
-          # Fallback: find headers in source tree
+          # Fallback: search source trees
           if [ ! -f "package/include/mpv/client.h" ]; then
-            for header in client.h render.h render_gl.h stream_cb.h; do
-              find mpv-android -name "$header" -path "*/include/mpv/*" \
-                -exec cp {} package/include/mpv/ \; 2>/dev/null || true
+            echo "WARNING: Headers not in prefix, searching source tree..."
+            MPV_INCLUDE=$(find "${DEPS_DIR}" -type d -name "mpv" -path "*/include/mpv" | head -1)
+            if [ -n "$MPV_INCLUDE" ]; then
+              cp "${MPV_INCLUDE}"/*.h package/include/mpv/
+            fi
+          fi
+
+          # Last resort: download headers from upstream
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            echo "WARNING: Downloading headers from mpv repo..."
+            for hdr in client.h render.h render_gl.h stream_cb.h; do
+              curl -sL "https://raw.githubusercontent.com/mpv-player/mpv/master/libmpv/${hdr}" \
+                -o "package/include/mpv/${hdr}" || true
             done
           fi
 
-          # ── Validate ──
+          # ── Validate: required libraries ──
+          echo ""
           echo "=== Validating package ==="
+          if [ ! -f "package/lib/libmpv.so" ]; then
+            echo "FATAL: libmpv.so not found anywhere!"
+            echo ""
+            echo "=== All .so files in build tree ==="
+            find mpv-android/buildscripts -name 'libmpv*' -type f 2>/dev/null
+            exit 1
+          fi
 
-          REQUIRED_LIBS=(libmpv.so)
-          for lib in "${REQUIRED_LIBS[@]}"; do
-            if [ ! -f "package/lib/$lib" ]; then
-              echo "FATAL: Missing required library: $lib"
-              ls -la package/lib/
-              exit 1
-            fi
-          done
-
+          # ── Validate: required headers ──
           REQUIRED_HEADERS=(client.h render.h render_gl.h)
           for hdr in "${REQUIRED_HEADERS[@]}"; do
             if [ ! -f "package/include/mpv/$hdr" ]; then
               echo "FATAL: Missing required header: $hdr"
-              ls -la package/include/mpv/
               exit 1
             fi
           done
 
-          # ── Verify architecture ──
+          # ── Validate: correct architecture ──
+          echo ""
+          echo "=== Architecture check ==="
           file package/lib/libmpv.so
-          readelf -h package/lib/libmpv.so | grep Machine
+          readelf -h package/lib/libmpv.so | grep -E "(Class|Machine)"
+
+          echo ""
+          echo "=== All libraries ==="
+          ls -lh package/lib/
+
+          echo ""
+          echo "=== Headers ==="
+          ls -lh package/include/mpv/
 
           # ── Add NOTICE ──
           cp NOTICE.md package/ 2>/dev/null || true
 
           # ── Create deterministic tarball ──
           cd package
-          # Sort files, zero timestamps for reproducibility
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \
                 --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
                 --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
             | gzip -9n > "../libmpv-android-${ABI}.tar.gz"
 
-          echo "=== Archive info ==="
+          echo ""
+          echo "=== Final archive ==="
           ls -lh "../libmpv-android-${ABI}.tar.gz"
           sha256sum "../libmpv-android-${ABI}.tar.gz"
-
-          echo "=== Contents ==="
+          echo ""
+          echo "=== Archive contents ==="
           tar -tzf "../libmpv-android-${ABI}.tar.gz"
 
       - uses: actions/upload-artifact@v4

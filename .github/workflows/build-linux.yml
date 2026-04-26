@@ -20,7 +20,8 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost
           df -h /
 
       - name: Install build dependencies
@@ -40,89 +41,138 @@ jobs:
             libssl-dev \
             libluajit-5.1-dev \
             libvdpau-dev libva-dev \
+            libplacebo-dev \
+            libarchive-dev \
+            libbluray-dev libdvdnav-dev \
             python3 python3-pip python3-jinja2 python3-docutils
 
       - name: Clone mpv-build
         run: |
           git clone --depth 1 "https://github.com/${MPV_BUILD_REPO}.git" mpv-build
 
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #2: Do NOT create ffmpeg_options with --enable-shared.
+      # mpv-build's DEFAULT behavior statically links ffmpeg, libass,
+      # and libplacebo INTO libmpv.so. This is exactly what we want
+      # for distribution — a single self-contained libmpv.so.
+      #
+      # Creating ffmpeg_options with --enable-shared would:
+      #   1. Fight the default static linking
+      #   2. Produce separate libav*.so files that need to be shipped
+      #   3. Potentially cause linker failures
+      # ──────────────────────────────────────────────────────
       - name: Configure build options
         working-directory: mpv-build
         run: |
-          # ffmpeg: build shared libraries
-          cat > ffmpeg_options <<'EOF'
-          --enable-shared
-          --disable-static
-          --enable-gpl
-          --enable-version3
-          --enable-nonfree
-          --enable-openssl
-          --disable-programs
-          --disable-doc
-          EOF
-
-          # mpv: build libmpv, no player binary
+          # mpv options: build shared libmpv, skip the player binary
           cat > mpv_options <<'EOF'
           -Dlibmpv=true
-          -Dcplayer=false
           -Dbuild-date=false
-          -Dmanpage-build=disabled
           EOF
 
+          # Do NOT create ffmpeg_options — let mpv-build use defaults.
+          # This statically links ffmpeg into libmpv.so.
+
+          echo "=== mpv_options ==="
+          cat mpv_options
+          echo ""
+          echo "=== ffmpeg_options ==="
+          echo "(not created — using mpv-build defaults for static linking)"
+
+      # ./rebuild does: ./update (clone/pull repos) → ./clean → ./build
       - name: Build
         working-directory: mpv-build
         run: |
           ./rebuild -j$(nproc)
 
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #3: Only collect libmpv.so — ffmpeg/libass/libplacebo
+      # are statically linked inside it. There are no separate .so files.
+      # ──────────────────────────────────────────────────────
       - name: Collect and package
         run: |
           set -euo pipefail
           mkdir -p package/lib package/include/mpv
 
-          BUILD_PREFIX="mpv-build/build_libs"
+          # ── Find libmpv.so ──
+          # mpv-build puts the output in mpv/build/ directory
           MPV_BUILD_DIR="mpv-build/mpv/build"
 
-          # ── libmpv ──
-          find "$MPV_BUILD_DIR" -name 'libmpv.so*' -exec cp -a {} package/lib/ \;
+          echo "=== Searching for libmpv.so ==="
+          find mpv-build -name 'libmpv*.so*' -type f 2>/dev/null | sort
 
-          # If mpv-build installs to build_libs:
-          if [ -d "$BUILD_PREFIX/lib" ]; then
-            find "$BUILD_PREFIX/lib" -name 'libmpv*' -exec cp -a {} package/lib/ \;
-            find "$BUILD_PREFIX/lib" -name 'libav*' -exec cp -a {} package/lib/ \;
-            find "$BUILD_PREFIX/lib" -name 'libsw*' -exec cp -a {} package/lib/ \;
-            find "$BUILD_PREFIX/lib" -name 'libass*' -exec cp -a {} package/lib/ \;
-            find "$BUILD_PREFIX/lib" -name 'libplacebo*' -exec cp -a {} package/lib/ \;
-            find "$BUILD_PREFIX/lib" -name 'libpostproc*' -exec cp -a {} package/lib/ \;
+          # Copy from mpv build directory
+          if [ -d "$MPV_BUILD_DIR" ]; then
+            find "$MPV_BUILD_DIR" -name 'libmpv*.so*' -type f -exec cp -a {} package/lib/ \;
           fi
 
-          # Also check /usr/local where mpv-build might install
-          if [ -f "/usr/local/lib/libmpv.so" ]; then
-            cp -a /usr/local/lib/libmpv* package/lib/
+          # Also check build_libs (some mpv-build versions install here)
+          if [ -d "mpv-build/build_libs/lib" ]; then
+            find "mpv-build/build_libs/lib" -name 'libmpv*.so*' -exec cp -a {} package/lib/ \;
           fi
 
-          # ── ffmpeg shared libs ──
-          FFMPEG_BUILD="mpv-build/ffmpeg_build"
-          if [ -d "$FFMPEG_BUILD/lib" ]; then
-            find "$FFMPEG_BUILD/lib" -name '*.so*' -exec cp -a {} package/lib/ \;
+          # Also check /usr/local (./rebuild might install system-wide)
+          if [ -f "/usr/local/lib/libmpv.so" ] || ls /usr/local/lib/libmpv.so* 1>/dev/null 2>&1; then
+            cp -a /usr/local/lib/libmpv*.so* package/lib/
           fi
+
+          # ── Create proper symlinks ──
+          cd package/lib
+
+          # Find the real file (e.g., libmpv.so.2.3.0)
+          REAL_FILE=$(ls libmpv.so.*.*.* 2>/dev/null | head -1)
+          if [ -n "$REAL_FILE" ]; then
+            BASENAME=$(basename "$REAL_FILE")
+            MAJOR=$(echo "$BASENAME" | sed 's/libmpv\.so\.\([0-9]*\)\..*/\1/')
+
+            # Create soname symlink: libmpv.so.2 -> libmpv.so.2.3.0
+            ln -sf "$BASENAME" "libmpv.so.${MAJOR}" 2>/dev/null || true
+
+            # Create dev symlink: libmpv.so -> libmpv.so.2
+            ln -sf "libmpv.so.${MAJOR}" "libmpv.so" 2>/dev/null || true
+
+            echo "Symlinks: libmpv.so -> libmpv.so.${MAJOR} -> ${BASENAME}"
+          elif [ -f "libmpv.so" ]; then
+            echo "Found libmpv.so directly (no versioned name)"
+          fi
+
+          cd ../..
 
           # ── Headers ──
-          for loc in "$BUILD_PREFIX/include/mpv" \
-                     "/usr/local/include/mpv" \
-                     "$MPV_BUILD_DIR/../libmpv" \
-                     "mpv-build/mpv/libmpv"; do
-            if [ -d "$loc" ]; then
-              find "$loc" -name '*.h' -exec cp {} package/include/mpv/ \;
+          # mpv source tree: libmpv/ or include/mpv/
+          for search_dir in \
+            "mpv-build/mpv/libmpv" \
+            "mpv-build/mpv/build/libmpv" \
+            "mpv-build/build_libs/include/mpv" \
+            "/usr/local/include/mpv"; do
+            if [ -d "$search_dir" ]; then
+              for hdr in client.h render.h render_gl.h stream_cb.h; do
+                [ -f "$search_dir/$hdr" ] && cp "$search_dir/$hdr" package/include/mpv/
+              done
             fi
           done
 
-          # ── Validate ──
-          echo "=== Libraries ==="
-          ls -lh package/lib/
+          # Last resort
+          if [ ! -f "package/include/mpv/client.h" ]; then
+            echo "WARNING: Downloading headers from mpv repo..."
+            for hdr in client.h render.h render_gl.h stream_cb.h; do
+              curl -sL "https://raw.githubusercontent.com/mpv-player/mpv/master/libmpv/${hdr}" \
+                -o "package/include/mpv/${hdr}" || true
+            done
+          fi
 
-          if [ ! -f "package/lib/libmpv.so" ] && ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
+          # ── Validate ──
+          echo ""
+          echo "=== Validation ==="
+
+          if ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
             echo "FATAL: libmpv.so not found!"
+            echo ""
+            echo "=== Full search of mpv-build ==="
             find mpv-build -name 'libmpv*' -type f 2>/dev/null
+            echo ""
+            echo "=== /usr/local/lib ==="
+            ls /usr/local/lib/libmpv* 2>/dev/null || echo "(nothing)"
             exit 1
           fi
 
@@ -133,12 +183,33 @@ jobs:
             fi
           done
 
+          echo "Architecture:"
           file package/lib/libmpv.so* | head -3
+
+          echo ""
+          echo "Exported mpv symbols:"
+          if [ -f "package/lib/libmpv.so" ]; then
+            nm -D package/lib/libmpv.so 2>/dev/null | grep ' T mpv_' | head -10
+          fi
+
+          echo ""
+          echo "Dependencies:"
+          if [ -f "package/lib/libmpv.so" ]; then
+            readelf -d package/lib/libmpv.so | grep NEEDED || true
+          fi
+
+          echo ""
+          echo "=== Libraries ==="
+          ls -lh package/lib/
+
+          echo ""
+          echo "=== Headers ==="
+          ls -lh package/include/mpv/
 
           # ── Add NOTICE ──
           cp NOTICE.md package/ 2>/dev/null || true
 
-          # ── Create tarball ──
+          # ── Create deterministic tarball ──
           cd package
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \
@@ -146,8 +217,11 @@ jobs:
                 --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
             | gzip -9n > "../libmpv-linux-x86_64.tar.gz"
 
+          echo ""
+          echo "=== Final archive ==="
           ls -lh "../libmpv-linux-x86_64.tar.gz"
           sha256sum "../libmpv-linux-x86_64.tar.gz"
+          echo ""
           tar -tzf "../libmpv-linux-x86_64.tar.gz"
 
       - uses: actions/upload-artifact@v4

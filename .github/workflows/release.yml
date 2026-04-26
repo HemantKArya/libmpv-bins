@@ -8,12 +8,22 @@ on:
         required: true
         type: string
       skip_android:
-        description: 'Skip Android build (use existing artifacts)'
+        description: 'Skip Android build'
         required: false
         type: boolean
         default: false
       skip_linux:
         description: 'Skip Linux build'
+        required: false
+        type: boolean
+        default: false
+      skip_windows:
+        description: 'Skip Windows fetch'
+        required: false
+        type: boolean
+        default: false
+      skip_darwin:
+        description: 'Skip macOS/iOS fetch'
         required: false
         type: boolean
         default: false
@@ -38,48 +48,61 @@ jobs:
     uses: ./.github/workflows/build-linux.yml
 
   fetch-windows:
+    if: ${{ !inputs.skip_windows }}
     uses: ./.github/workflows/fetch-windows.yml
 
   fetch-darwin:
+    if: ${{ !inputs.skip_darwin }}
     uses: ./.github/workflows/fetch-darwin.yml
 
   # ══════════════════════════════════════
   # 2. Collect and release
+  # ──────────────────────────────────────
+  # FIX BUG #5: Use always() so this runs even when some
+  # jobs are skipped. Use pattern-based artifact download
+  # so missing artifacts don't cause failures.
   # ══════════════════════════════════════
   release:
     needs: [build-android, build-linux, fetch-windows, fetch-darwin]
-    if: always() && !cancelled()
+    # Run if at least one upstream job succeeded (not all skipped/failed)
+    if: |
+      always() && !cancelled() &&
+      (needs.build-android.result == 'success' ||
+       needs.build-linux.result == 'success' ||
+       needs.fetch-windows.result == 'success' ||
+       needs.fetch-darwin.result == 'success')
     runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download ALL artifacts
+      # Download only artifacts that match our naming pattern.
+      # This won't fail if some platform jobs were skipped.
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          pattern: libmpv-*
 
       - name: Collect tarballs and generate checksums
+        id: collect
         run: |
           set -euo pipefail
           mkdir -p release
 
-          echo "=== All artifacts ==="
+          echo "=== All downloaded artifacts ==="
           find artifacts/ -type f -name '*.tar.gz' | sort
 
           # Flatten all .tar.gz into release/
           find artifacts/ -name '*.tar.gz' -exec cp {} release/ \;
 
-          echo ""
-          echo "=== Release contents ==="
-          ls -lh release/
-
-          # Count what we got
           TOTAL=$(ls release/*.tar.gz 2>/dev/null | wc -l)
           echo "Total archives: $TOTAL"
 
           if [ "$TOTAL" -eq 0 ]; then
             echo "FATAL: No archives collected!"
+            echo "Artifact directory contents:"
+            find artifacts/ -type f 2>/dev/null || echo "(empty)"
             exit 1
           fi
 
@@ -91,64 +114,97 @@ jobs:
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS.txt
 
-      - name: Generate release body
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────
+      # FIX BUG #9: Generate release notes dynamically from
+      # actual artifacts, not a hardcoded list.
+      # ──────────────────────────────────────────────────────
+      - name: Generate release notes
         run: |
           VERSION="${{ inputs.version }}"
-          cat > release/RELEASE_NOTES.md <<EOF
+
+          cat > release_body.md <<EOF
           ## libmpv prebuilt binaries v${VERSION}
 
           Built and packaged automatically via GitHub Actions.
+          Verified checksums included in \`SHA256SUMS.txt\`.
 
           ### Available Archives
 
-          | Platform | Architecture | Archive | Verified |
-          |----------|-------------|---------|----------|
+          | Platform | Architecture | Archive | Size |
+          |----------|-------------|---------|------|
           EOF
 
+          # Dynamically list only the archives we actually built
           for f in release/libmpv-*.tar.gz; do
+            [ -f "$f" ] || continue
             BASENAME=$(basename "$f")
             SIZE=$(du -h "$f" | cut -f1)
-            # Parse: libmpv-{platform}-{arch}.tar.gz
-            PARTS=$(echo "$BASENAME" | sed 's/libmpv-//;s/.tar.gz//')
-            PLATFORM=$(echo "$PARTS" | rev | cut -d- -f2- | rev)
-            ARCH=$(echo "$PARTS" | rev | cut -d- -f1 | rev)
 
-            echo "| ${PLATFORM} | ${ARCH} | \`${BASENAME}\` (${SIZE}) | ✓ |" >> release/RELEASE_NOTES.md
+            # Parse: libmpv-{platform}-{arch}.tar.gz
+            NAME_NO_EXT=$(echo "$BASENAME" | sed 's/.tar.gz//')
+            # Remove "libmpv-" prefix
+            PLATFORM_ARCH=$(echo "$NAME_NO_EXT" | sed 's/^libmpv-//')
+
+            # Split on last hyphen to get platform and arch
+            # Handles: android-arm64-v8a, iossimulator-x86_64, etc.
+            case "$PLATFORM_ARCH" in
+              android-arm64-v8a)    PLATFORM="Android"; ARCH="arm64-v8a" ;;
+              android-armeabi-v7a)  PLATFORM="Android"; ARCH="armeabi-v7a" ;;
+              android-x86_64)       PLATFORM="Android"; ARCH="x86_64" ;;
+              android-x86)          PLATFORM="Android"; ARCH="x86" ;;
+              linux-x86_64)         PLATFORM="Linux"; ARCH="x86_64" ;;
+              windows-x86_64)       PLATFORM="Windows"; ARCH="x86_64" ;;
+              windows-aarch64)      PLATFORM="Windows"; ARCH="aarch64" ;;
+              macos-arm64)          PLATFORM="macOS"; ARCH="arm64" ;;
+              macos-x86_64)         PLATFORM="macOS"; ARCH="x86_64" ;;
+              ios-arm64)            PLATFORM="iOS"; ARCH="arm64" ;;
+              iossimulator-arm64)   PLATFORM="iOS Simulator"; ARCH="arm64" ;;
+              iossimulator-x86_64)  PLATFORM="iOS Simulator"; ARCH="x86_64" ;;
+              *)                    PLATFORM="$PLATFORM_ARCH"; ARCH="-" ;;
+            esac
+
+            echo "| ${PLATFORM} | ${ARCH} | \`${BASENAME}\` | ${SIZE} |" >> release_body.md
           done
 
-          cat >> release/RELEASE_NOTES.md <<'EOF'
+          cat >> release_body.md <<'EOF'
 
-          ### Sources
-
-          | Platform | Source |
-          |----------|--------|
-          | Android | Compiled from [mpv-android](https://github.com/mpv-android/mpv-android) buildscripts |
-          | Linux | Compiled from [mpv-build](https://github.com/mpv-player/mpv-build) |
-          | Windows | Repackaged from [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) |
-          | macOS/iOS | Repackaged from [media-kit/libmpv-darwin-build](https://github.com/media-kit/libmpv-darwin-build) |
+          ### Build Sources
+          | Platform | Method | Source |
+          |----------|--------|--------|
+          | Android | Compiled from source | [mpv-android](https://github.com/mpv-android/mpv-android) |
+          | Linux | Compiled from source | [mpv-build](https://github.com/mpv-player/mpv-build) |
+          | Windows | Official prebuilt | [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) |
+          | macOS/iOS | Official prebuilt | [media-kit/libmpv-darwin-build](https://github.com/media-kit/libmpv-darwin-build) |
 
           ### Verification
           ```bash
           sha256sum -c SHA256SUMS.txt
           ```
 
-          ### Archive Structure
-          Every archive has this layout:
+          ### Archive Layout
           ```
-          lib/              # .so / .dll / .dylib / .a / .framework
+          lib/              # .so / .dll / .dylib / .a
+          bin/              # (Windows only) libmpv-2.dll
           include/mpv/      # client.h, render.h, render_gl.h, stream_cb.h
+          Frameworks/       # (macOS/iOS only, if applicable)
           NOTICE.md         # License attribution
           ```
           EOF
+
+          echo "=== Release body ==="
+          cat release_body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ inputs.version }}"
           name: "v${{ inputs.version }}"
-          body_path: release/RELEASE_NOTES.md
+          body_path: release_body.md
           draft: false
           prerelease: false
           files: |
             release/libmpv-*.tar.gz
             release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
