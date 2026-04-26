@@ -6,7 +6,23 @@ on:
 
 jobs:
   windows:
-    runs-on: ubuntu-22.04
+    # ──────────────────────────────────────────────────────
+    # MUST use ubuntu-24.04 (not 22.04).
+    #
+    # shinchiro .7z files use LZMA2:96m compression which
+    # requires 7-Zip >= 23.01 to decompress.
+    #
+    # Ubuntu 22.04 apt:
+    #   p7zip-full → 7z 16.02  → TOO OLD
+    #   7zip       → 7zz 21.07 → TOO OLD
+    #
+    # Ubuntu 24.04 apt:
+    #   7zip       → 7zz 24.09 → WORKS ✓
+    #
+    # Downloading 7zz from 7-zip.org fails because they
+    # block requests from GitHub Actions datacenter IPs.
+    # ──────────────────────────────────────────────────────
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -28,21 +44,11 @@ jobs:
           echo "SHINCHIRO_REPO=$SHINCHIRO_REPO" >> "$GITHUB_ENV"
           echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
 
-      # ──────────────────────────────────────────────────────
-      # Download official 7-Zip 24.08 directly.
-      # Ubuntu 22.04 apt versions are all too old:
-      #   p7zip-full = 16.02 (2016) — can't decompress LZMA2:96m
-      #   7zip       = 21.07 (2021) — can't decompress LZMA2:96m
-      # Need >= 23.01 for the methods shinchiro builds use.
-      # ──────────────────────────────────────────────────────
-      - name: Install modern 7-Zip
+      - name: Install 7-Zip
         run: |
-          wget -q "https://www.7-zip.org/a/7z2408-linux-x64.tar.xz" -O /tmp/7z.tar.xz
-          sudo mkdir -p /opt/7zip
-          sudo tar -xf /tmp/7z.tar.xz -C /opt/7zip
-          sudo ln -sf /opt/7zip/7zz /usr/local/bin/7zz
-          rm /tmp/7z.tar.xz
-          echo "Installed: $(7zz --help 2>&1 | head -1)"
+          sudo apt-get update
+          sudo apt-get install -y 7zip
+          echo "Installed: $(7zz --help 2>&1 | head -2)"
 
       - name: Download shinchiro dev build
         run: |
@@ -115,7 +121,6 @@ jobs:
           echo "=== Raw extraction contents ==="
           find mpv-dev-raw -type f | sort
 
-          # Find actual content root by locating client.h
           CONTENT_ROOT=$(find mpv-dev-raw -name 'client.h' -printf '%h\n' | head -1)
           if [ -n "$CONTENT_ROOT" ]; then
             CONTENT_ROOT=$(echo "$CONTENT_ROOT" | sed 's|/include/mpv$||')
