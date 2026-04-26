@@ -28,8 +28,17 @@ jobs:
           echo "SHINCHIRO_REPO=$SHINCHIRO_REPO" >> "$GITHUB_ENV"
           echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
 
+      # ──────────────────────────────────────────────────────
+      # FIX: Use modern 7-Zip (7zz) instead of legacy p7zip (7z).
+      # p7zip-full on Ubuntu 22.04 is v16.02 (2016) and CANNOT
+      # decompress the LZMA2 methods used by shinchiro .7z files.
+      # The "7zip" package provides "7zz" — the official Linux
+      # port of 7-Zip by Igor Pavlov (v23.01+).
+      # ──────────────────────────────────────────────────────
       - name: Install tools
-        run: sudo apt-get install -y p7zip-full
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y 7zip
 
       - name: Download shinchiro dev build
         run: |
@@ -44,11 +53,6 @@ jobs:
           echo "Fetching release info from: $API_URL"
           RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
 
-          # ──────────────────────────────────────────────────────
-          # FIX BUG #3 & #8: Improved asset matching.
-          # Actual asset names: mpv-dev-x86_64-20260421-git-5921fe5.7z
-          # Must exclude: -v3- (AVX2 build), -gcc- (GCC variant)
-          # ──────────────────────────────────────────────────────
           DEV_URL=$(echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
@@ -60,7 +64,6 @@ jobs:
                   continue
               if not name.endswith('.7z'):
                   continue
-              # Skip excluded variants
               skip = False
               for excl in excludes:
                   excl = excl.strip()
@@ -90,41 +93,30 @@ jobs:
           curl -L --fail --progress-bar -o mpv-dev.7z "$DEV_URL"
           ls -lh mpv-dev.7z
 
-          # Record source URL for provenance
           echo "$DEV_URL" > source-url.txt
 
-          # Also record the release tag
           echo "$RELEASE_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           print(data.get('tag_name', 'unknown'))
           " > source-tag.txt
 
-      # ──────────────────────────────────────────────────────
-      # FIX BUG #4: 7z extracts into a named subdirectory like
-      # mpv-dev-x86_64-20260421-git-5921fe5/
-      # Must handle this nesting properly.
-      # ──────────────────────────────────────────────────────
       - name: Extract and repackage
         run: |
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
 
-          7z x mpv-dev.7z -ompv-dev-raw
+          # ── Use 7zz (modern 7-Zip), NOT 7z (legacy p7zip) ──
+          7zz x mpv-dev.7z -ompv-dev-raw
 
           echo "=== Raw extraction contents ==="
           find mpv-dev-raw -type f | sort
 
-          # Find the actual content root.
-          # 7z might extract into a subdirectory, or directly into mpv-dev-raw.
-          # Detect by looking for where client.h lives.
+          # Find actual content root by locating client.h
           CONTENT_ROOT=$(find mpv-dev-raw -name 'client.h' -printf '%h\n' | head -1)
           if [ -n "$CONTENT_ROOT" ]; then
-            # client.h is in .../include/mpv/ — go up to the package root
-            # e.g. mpv-dev-raw/mpv-dev-x86_64-.../include/mpv → mpv-dev-raw/mpv-dev-x86_64-...
             CONTENT_ROOT=$(echo "$CONTENT_ROOT" | sed 's|/include/mpv$||')
           else
-            # Fallback: use the first subdirectory
             CONTENT_ROOT=$(find mpv-dev-raw -mindepth 1 -maxdepth 1 -type d | head -1)
             if [ -z "$CONTENT_ROOT" ]; then
               CONTENT_ROOT="mpv-dev-raw"
@@ -139,7 +131,6 @@ jobs:
           mkdir -p package/lib package/bin package/include/mpv
 
           # ── Headers ──
-          # shinchiro dev packages have include/mpv/{client.h, render.h, render_gl.h, stream_cb.h}
           if [ -d "$CONTENT_ROOT/include/mpv" ]; then
             cp "$CONTENT_ROOT/include/mpv"/*.h package/include/mpv/
           else
@@ -149,9 +140,7 @@ jobs:
           fi
 
           # ── DLL ──
-          # shinchiro names it libmpv-2.dll
           find "$CONTENT_ROOT" -name 'libmpv-2.dll' -type f -exec cp {} package/bin/ \;
-          # Fallback name
           if [ ! -f "package/bin/libmpv-2.dll" ]; then
             find "$CONTENT_ROOT" -name 'mpv-2.dll' -type f -exec cp {} package/bin/ \;
           fi
@@ -165,7 +154,6 @@ jobs:
           echo ""
           echo "=== Validation ==="
 
-          # Must have DLL
           if [ ! -f "package/bin/libmpv-2.dll" ] && [ ! -f "package/bin/mpv-2.dll" ]; then
             echo "FATAL: No DLL found (libmpv-2.dll or mpv-2.dll)"
             echo "All files in content root:"
@@ -173,13 +161,11 @@ jobs:
             exit 1
           fi
 
-          # Must have import library
           if [ ! -f "package/lib/libmpv.dll.a" ] && [ ! -f "package/lib/mpv.lib" ]; then
             echo "FATAL: No import library found (libmpv.dll.a or mpv.lib)"
             exit 1
           fi
 
-          # Must have headers
           for hdr in client.h render.h render_gl.h; do
             if [ ! -f "package/include/mpv/$hdr" ]; then
               echo "FATAL: Missing header: $hdr"
