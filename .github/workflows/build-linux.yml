@@ -24,11 +24,45 @@ jobs:
             /opt/hostedtoolcache /usr/local/share/boost
           df -h /
 
+      # ──────────────────────────────────────────────────────
+      # FIX: Ubuntu 22.04 ships meson 0.61.2.
+      # Modern libplacebo requires meson >= 1.3.0.
+      # Install newer meson + ninja via pip FIRST, then
+      # install the rest via apt. The pip versions will
+      # take priority in PATH.
+      # ──────────────────────────────────────────────────────
+      - name: Install modern meson and ninja via pip
+        run: |
+          # Remove system meson/ninja to avoid conflicts
+          sudo apt-get remove -y meson ninja-build 2>/dev/null || true
+
+          # Install latest meson + ninja via pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade meson ninja
+
+          # Verify versions
+          echo "=== Installed versions ==="
+          meson --version
+          ninja --version
+
+          # Confirm meson is >= 1.3.0
+          MESON_VER=$(meson --version)
+          echo "Meson version: $MESON_VER"
+          python3 -c "
+          import sys
+          parts = '$MESON_VER'.split('.')
+          major, minor = int(parts[0]), int(parts[1])
+          if major < 1 or (major == 1 and minor < 3):
+              print(f'FATAL: meson {\"$MESON_VER\"} < 1.3.0')
+              sys.exit(1)
+          print(f'OK: meson {\"$MESON_VER\"} >= 1.3.0')
+          "
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake meson ninja-build nasm yasm \
+            build-essential git cmake nasm yasm \
             pkg-config autoconf automake libtool \
             libwayland-dev wayland-protocols libxkbcommon-dev \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
@@ -41,26 +75,27 @@ jobs:
             libssl-dev \
             libluajit-5.1-dev \
             libvdpau-dev libva-dev \
-            libplacebo-dev \
             libarchive-dev \
             libbluray-dev libdvdnav-dev \
             python3 python3-pip python3-jinja2 python3-docutils
+
+          # Do NOT install meson or ninja-build from apt — we use pip versions
+
+      - name: Verify tool versions
+        run: |
+          echo "=== Tool versions ==="
+          echo "meson: $(meson --version)"
+          echo "ninja: $(ninja --version)"
+          echo "gcc:   $(gcc --version | head -1)"
+          echo "nasm:  $(nasm --version)"
+          echo "pkg-config: $(pkg-config --version)"
+          which meson
+          which ninja
 
       - name: Clone mpv-build
         run: |
           git clone --depth 1 "https://github.com/${MPV_BUILD_REPO}.git" mpv-build
 
-      # ──────────────────────────────────────────────────────
-      # FIX BUG #2: Do NOT create ffmpeg_options with --enable-shared.
-      # mpv-build's DEFAULT behavior statically links ffmpeg, libass,
-      # and libplacebo INTO libmpv.so. This is exactly what we want
-      # for distribution — a single self-contained libmpv.so.
-      #
-      # Creating ffmpeg_options with --enable-shared would:
-      #   1. Fight the default static linking
-      #   2. Produce separate libav*.so files that need to be shipped
-      #   3. Potentially cause linker failures
-      # ──────────────────────────────────────────────────────
       - name: Configure build options
         working-directory: mpv-build
         run: |
@@ -71,75 +106,68 @@ jobs:
           EOF
 
           # Do NOT create ffmpeg_options — let mpv-build use defaults.
-          # This statically links ffmpeg into libmpv.so.
+          # Default = static linking of ffmpeg into libmpv.so
+          # This produces one self-contained .so with zero external deps.
 
           echo "=== mpv_options ==="
           cat mpv_options
-          echo ""
-          echo "=== ffmpeg_options ==="
-          echo "(not created — using mpv-build defaults for static linking)"
 
-      # ./rebuild does: ./update (clone/pull repos) → ./clean → ./build
       - name: Build
         working-directory: mpv-build
         run: |
+          # Ensure pip-installed meson/ninja are found first
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "Using meson: $(which meson) ($(meson --version))"
+          echo "Using ninja: $(which ninja) ($(ninja --version))"
+
           ./rebuild -j$(nproc)
 
-      # ──────────────────────────────────────────────────────
-      # FIX BUG #3: Only collect libmpv.so — ffmpeg/libass/libplacebo
-      # are statically linked inside it. There are no separate .so files.
-      # ──────────────────────────────────────────────────────
       - name: Collect and package
         run: |
           set -euo pipefail
           mkdir -p package/lib package/include/mpv
 
           # ── Find libmpv.so ──
-          # mpv-build puts the output in mpv/build/ directory
-          MPV_BUILD_DIR="mpv-build/mpv/build"
-
           echo "=== Searching for libmpv.so ==="
           find mpv-build -name 'libmpv*.so*' -type f 2>/dev/null | sort
 
-          # Copy from mpv build directory
-          if [ -d "$MPV_BUILD_DIR" ]; then
-            find "$MPV_BUILD_DIR" -name 'libmpv*.so*' -type f -exec cp -a {} package/lib/ \;
-          fi
+          # Search in all possible locations
+          for search_dir in \
+            "mpv-build/mpv/build" \
+            "mpv-build/build_libs/lib" \
+            "mpv-build/build_libs/lib64"; do
+            if [ -d "$search_dir" ]; then
+              find "$search_dir" -name 'libmpv*.so*' -type f -exec cp -a {} package/lib/ \; 2>/dev/null || true
+            fi
+          done
 
-          # Also check build_libs (some mpv-build versions install here)
-          if [ -d "mpv-build/build_libs/lib" ]; then
-            find "mpv-build/build_libs/lib" -name 'libmpv*.so*' -exec cp -a {} package/lib/ \;
-          fi
-
-          # Also check /usr/local (./rebuild might install system-wide)
-          if [ -f "/usr/local/lib/libmpv.so" ] || ls /usr/local/lib/libmpv.so* 1>/dev/null 2>&1; then
-            cp -a /usr/local/lib/libmpv*.so* package/lib/
+          # Check /usr/local (./rebuild might install system-wide)
+          if ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
+            if ls /usr/local/lib/libmpv.so* 1>/dev/null 2>&1; then
+              cp -a /usr/local/lib/libmpv*.so* package/lib/
+            fi
+            if ls /usr/local/lib/x86_64-linux-gnu/libmpv.so* 1>/dev/null 2>&1; then
+              cp -a /usr/local/lib/x86_64-linux-gnu/libmpv*.so* package/lib/
+            fi
           fi
 
           # ── Create proper symlinks ──
           cd package/lib
 
-          # Find the real file (e.g., libmpv.so.2.3.0)
           REAL_FILE=$(ls libmpv.so.*.*.* 2>/dev/null | head -1)
           if [ -n "$REAL_FILE" ]; then
             BASENAME=$(basename "$REAL_FILE")
             MAJOR=$(echo "$BASENAME" | sed 's/libmpv\.so\.\([0-9]*\)\..*/\1/')
-
-            # Create soname symlink: libmpv.so.2 -> libmpv.so.2.3.0
             ln -sf "$BASENAME" "libmpv.so.${MAJOR}" 2>/dev/null || true
-
-            # Create dev symlink: libmpv.so -> libmpv.so.2
             ln -sf "libmpv.so.${MAJOR}" "libmpv.so" 2>/dev/null || true
-
             echo "Symlinks: libmpv.so -> libmpv.so.${MAJOR} -> ${BASENAME}"
           elif [ -f "libmpv.so" ]; then
-            echo "Found libmpv.so directly (no versioned name)"
+            echo "Found libmpv.so directly"
           fi
 
           cd ../..
 
           # ── Headers ──
-          # mpv source tree: libmpv/ or include/mpv/
           for search_dir in \
             "mpv-build/mpv/libmpv" \
             "mpv-build/mpv/build/libmpv" \
@@ -152,7 +180,7 @@ jobs:
             fi
           done
 
-          # Last resort
+          # Last resort: download from upstream
           if [ ! -f "package/include/mpv/client.h" ]; then
             echo "WARNING: Downloading headers from mpv repo..."
             for hdr in client.h render.h render_gl.h stream_cb.h; do
@@ -168,11 +196,12 @@ jobs:
           if ! ls package/lib/libmpv.so* 1>/dev/null 2>&1; then
             echo "FATAL: libmpv.so not found!"
             echo ""
-            echo "=== Full search of mpv-build ==="
+            echo "=== Full search of build tree ==="
             find mpv-build -name 'libmpv*' -type f 2>/dev/null
             echo ""
             echo "=== /usr/local/lib ==="
-            ls /usr/local/lib/libmpv* 2>/dev/null || echo "(nothing)"
+            ls -la /usr/local/lib/libmpv* 2>/dev/null || echo "(nothing)"
+            ls -la /usr/local/lib/x86_64-linux-gnu/libmpv* 2>/dev/null || echo "(nothing)"
             exit 1
           fi
 
@@ -193,7 +222,7 @@ jobs:
           fi
 
           echo ""
-          echo "Dependencies:"
+          echo "Dependencies (NEEDED):"
           if [ -f "package/lib/libmpv.so" ]; then
             readelf -d package/lib/libmpv.so | grep NEEDED || true
           fi
@@ -206,7 +235,7 @@ jobs:
           echo "=== Headers ==="
           ls -lh package/include/mpv/
 
-          # ── Add NOTICE ──
+          # ── NOTICE ──
           cp NOTICE.md package/ 2>/dev/null || true
 
           # ── Create deterministic tarball ──

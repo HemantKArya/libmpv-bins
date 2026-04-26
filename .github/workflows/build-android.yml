@@ -44,13 +44,30 @@ jobs:
           echo "=== After cleanup ==="
           df -h /
 
+      # ──────────────────────────────────────────────────────
+      # FIX: Android SDK command-line tools (2024+) require Java 17.
+      # GitHub runners have multiple JDKs installed but default to 11.
+      # Use setup-java to guarantee Java 17 is active and JAVA_HOME is set.
+      # ──────────────────────────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Verify Java version
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          javac -version
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool pkg-config ninja-build \
             python3 python3-pip python3-setuptools python3-jsonschema \
-            nasm wget unzip meson git openjdk-17-jdk-headless
+            nasm wget unzip meson git
 
       - name: Clone mpv-android
         run: |
@@ -66,17 +83,10 @@ jobs:
       - name: Download sources and SDK
         working-directory: mpv-android/buildscripts
         run: |
-          # download.sh fetches: Android SDK, NDK, and all source tarballs
-          # (ffmpeg, dav1d, mbedtls, libass, libplacebo, mpv, etc.)
+          # Verify Java 17 is active before SDK download
+          java -version 2>&1 | head -1
           ./download.sh
 
-      # ──────────────────────────────────────────────────────
-      # FIX BUG #1: Must specify "mpv" target to avoid
-      # building the Java/Gradle Android app (which we don't need).
-      # ./buildall.sh --arch arm64 mpv
-      #   → Builds mpv AND all its native dependencies
-      #   → Does NOT build the Android APK
-      # ──────────────────────────────────────────────────────
       - name: Build for ${{ matrix.arch }}
         working-directory: mpv-android/buildscripts
         run: |
@@ -86,10 +96,6 @@ jobs:
             ./buildall.sh --arch ${{ matrix.arch }} --clean mpv
           fi
 
-      # ──────────────────────────────────────────────────────
-      # FIX BUG #6: libmpv.so is not always in prefix/{arch}/lib.
-      # Search multiple locations as fallback.
-      # ──────────────────────────────────────────────────────
       - name: Package
         run: |
           set -euo pipefail
@@ -101,35 +107,31 @@ jobs:
           mkdir -p package/lib package/include/mpv
 
           # ── Collect .so files ──
-          # Primary location: prefix/{arch}/lib
           if [ -d "${PREFIX}/lib" ]; then
             find "${PREFIX}/lib" -maxdepth 1 -name '*.so' -exec cp {} package/lib/ \;
           fi
 
-          # Fallback: if libmpv.so not in prefix, search deps build output
+          # Fallback: search deps build output
           if [ ! -f "package/lib/libmpv.so" ]; then
-            echo "WARNING: libmpv.so not in prefix, searching deps directory..."
+            echo "WARNING: libmpv.so not in prefix, searching deps..."
             find "${DEPS_DIR}" -name 'libmpv.so' -type f 2>/dev/null | while read -r f; do
               echo "  Found: $f"
               cp "$f" package/lib/
             done
           fi
 
-          # Also grab any libmpv dependencies that were built
+          # Grab dependency .so files from deps subdirs
           if [ ! -f "package/lib/libavcodec.so" ]; then
-            # Some mpv-android versions put libs in deps subdirs
             for dep_dir in "${DEPS_DIR}"/*/lib; do
               [ -d "$dep_dir" ] && find "$dep_dir" -maxdepth 1 -name '*.so' -exec cp -n {} package/lib/ \;
             done
           fi
 
           # ── Collect headers ──
-          # Primary: prefix/{arch}/include/mpv
           if [ -d "${PREFIX}/include/mpv" ]; then
             cp "${PREFIX}/include/mpv"/*.h package/include/mpv/
           fi
 
-          # Fallback: search source trees
           if [ ! -f "package/include/mpv/client.h" ]; then
             echo "WARNING: Headers not in prefix, searching source tree..."
             MPV_INCLUDE=$(find "${DEPS_DIR}" -type d -name "mpv" -path "*/include/mpv" | head -1)
@@ -138,7 +140,7 @@ jobs:
             fi
           fi
 
-          # Last resort: download headers from upstream
+          # Last resort: download headers
           if [ ! -f "package/include/mpv/client.h" ]; then
             echo "WARNING: Downloading headers from mpv repo..."
             for hdr in client.h render.h render_gl.h stream_cb.h; do
@@ -147,18 +149,15 @@ jobs:
             done
           fi
 
-          # ── Validate: required libraries ──
+          # ── Validate ──
           echo ""
           echo "=== Validating package ==="
           if [ ! -f "package/lib/libmpv.so" ]; then
-            echo "FATAL: libmpv.so not found anywhere!"
-            echo ""
-            echo "=== All .so files in build tree ==="
+            echo "FATAL: libmpv.so not found!"
             find mpv-android/buildscripts -name 'libmpv*' -type f 2>/dev/null
             exit 1
           fi
 
-          # ── Validate: required headers ──
           REQUIRED_HEADERS=(client.h render.h render_gl.h)
           for hdr in "${REQUIRED_HEADERS[@]}"; do
             if [ ! -f "package/include/mpv/$hdr" ]; then
@@ -167,7 +166,6 @@ jobs:
             fi
           done
 
-          # ── Validate: correct architecture ──
           echo ""
           echo "=== Architecture check ==="
           file package/lib/libmpv.so
