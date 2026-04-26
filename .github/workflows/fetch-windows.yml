@@ -6,22 +6,6 @@ on:
 
 jobs:
   windows:
-    # ──────────────────────────────────────────────────────
-    # MUST use ubuntu-24.04 (not 22.04).
-    #
-    # shinchiro .7z files use LZMA2:96m compression which
-    # requires 7-Zip >= 23.01 to decompress.
-    #
-    # Ubuntu 22.04 apt:
-    #   p7zip-full → 7z 16.02  → TOO OLD
-    #   7zip       → 7zz 21.07 → TOO OLD
-    #
-    # Ubuntu 24.04 apt:
-    #   7zip       → 7zz 24.09 → WORKS ✓
-    #
-    # Downloading 7zz from 7-zip.org fails because they
-    # block requests from GitHub Actions datacenter IPs.
-    # ──────────────────────────────────────────────────────
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -44,11 +28,134 @@ jobs:
           echo "SHINCHIRO_REPO=$SHINCHIRO_REPO" >> "$GITHUB_ENV"
           echo "SHINCHIRO_TAG=$SHINCHIRO_TAG" >> "$GITHUB_ENV"
 
-      - name: Install 7-Zip
+      # ──────────────────────────────────────────────────────
+      # Install 7-Zip with multiple fallbacks.
+      # We need >= 23.01 to decompress shinchiro's LZMA2:96m.
+      #
+      # Strategy:
+      #   1. Try apt (7zip or p7zip-full)
+      #   2. Check if binary works and is new enough
+      #   3. If not, download from ip7z/7zip GitHub releases
+      #   4. Export working binary name as SEVENZIP env var
+      # ──────────────────────────────────────────────────────
+      - name: Install modern 7-Zip
         run: |
-          sudo apt-get update
-          sudo apt-get install -y 7zip
-          echo "Installed: $(7zz --help 2>&1 | head -2)"
+          set -euo pipefail
+
+          find_7z_binary() {
+            for bin in 7zz 7z; do
+              if command -v "$bin" &>/dev/null; then
+                echo "$bin"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          check_version_ok() {
+            local bin="\$1"
+            # Extract version number, need >= 23.01
+            local ver
+            ver=$("$bin" --help 2>&1 | head -3 | grep -oP '\d+\.\d+' | head -1 || true)
+            if [ -z "$ver" ]; then
+              ver=$("$bin" 2>&1 | head -3 | grep -oP '\d+\.\d+' | head -1 || true)
+            fi
+            echo "  Found $bin version: $ver"
+            if [ -z "$ver" ]; then
+              return 1
+            fi
+            local major minor
+            major=$(echo "$ver" | cut -d. -f1)
+            minor=$(echo "$ver" | cut -d. -f2)
+            if [ "$major" -ge 24 ] || ([ "$major" -eq 23 ] && [ "$minor" -ge 1 ]); then
+              return 0
+            fi
+            echo "  Version $ver is too old (need >= 23.01)"
+            return 1
+          }
+
+          SEVENZIP=""
+
+          # ── Attempt 1: apt install ──
+          echo "=== Attempt 1: apt install ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y 7zip 2>/dev/null || \
+          sudo apt-get install -y p7zip-full 2>/dev/null || true
+
+          if BIN=$(find_7z_binary); then
+            if check_version_ok "$BIN"; then
+              SEVENZIP="$BIN"
+              echo "  ✓ Using apt-installed $BIN"
+            fi
+          fi
+
+          # ── Attempt 2: Download from ip7z/7zip GitHub releases ──
+          if [ -z "$SEVENZIP" ]; then
+            echo ""
+            echo "=== Attempt 2: Download from GitHub (ip7z/7zip) ==="
+            DOWNLOAD_URL="https://github.com/ip7z/7zip/releases/download/24.09/7z2409-linux-x64.tar.xz"
+            echo "  Downloading: $DOWNLOAD_URL"
+            if curl -L --fail --silent --show-error -o /tmp/7z.tar.xz "$DOWNLOAD_URL"; then
+              sudo mkdir -p /opt/7zip
+              sudo tar -xf /tmp/7z.tar.xz -C /opt/7zip
+              rm -f /tmp/7z.tar.xz
+              if [ -f /opt/7zip/7zz ]; then
+                sudo chmod +x /opt/7zip/7zz
+                sudo ln -sf /opt/7zip/7zz /usr/local/bin/7zz
+                SEVENZIP="7zz"
+                echo "  ✓ Downloaded and installed 7zz from GitHub"
+              fi
+            else
+              echo "  ✗ GitHub download failed, trying alternative URL..."
+              # Try older release
+              DOWNLOAD_URL="https://github.com/ip7z/7zip/releases/download/24.08/7z2408-linux-x64.tar.xz"
+              if curl -L --fail --silent --show-error -o /tmp/7z.tar.xz "$DOWNLOAD_URL"; then
+                sudo mkdir -p /opt/7zip
+                sudo tar -xf /tmp/7z.tar.xz -C /opt/7zip
+                rm -f /tmp/7z.tar.xz
+                if [ -f /opt/7zip/7zz ]; then
+                  sudo chmod +x /opt/7zip/7zz
+                  sudo ln -sf /opt/7zip/7zz /usr/local/bin/7zz
+                  SEVENZIP="7zz"
+                  echo "  ✓ Downloaded and installed 7zz (24.08) from GitHub"
+                fi
+              fi
+            fi
+          fi
+
+          # ── Attempt 3: Download static binary from 7-zip.org via curl ──
+          if [ -z "$SEVENZIP" ]; then
+            echo ""
+            echo "=== Attempt 3: Download from 7-zip.org ==="
+            if curl -L --fail --silent --show-error -o /tmp/7z.tar.xz \
+              "https://www.7-zip.org/a/7z2408-linux-x64.tar.xz"; then
+              sudo mkdir -p /opt/7zip
+              sudo tar -xf /tmp/7z.tar.xz -C /opt/7zip
+              rm -f /tmp/7z.tar.xz
+              if [ -f /opt/7zip/7zz ]; then
+                sudo chmod +x /opt/7zip/7zz
+                sudo ln -sf /opt/7zip/7zz /usr/local/bin/7zz
+                SEVENZIP="7zz"
+                echo "  ✓ Downloaded from 7-zip.org"
+              fi
+            else
+              echo "  ✗ 7-zip.org download also failed"
+            fi
+          fi
+
+          # ── Final check ──
+          if [ -z "$SEVENZIP" ]; then
+            echo ""
+            echo "FATAL: Could not install a working 7-Zip >= 23.01"
+            echo "Tried: apt, GitHub releases, 7-zip.org"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Final 7-Zip setup ==="
+          echo "Binary: $SEVENZIP ($(which "$SEVENZIP"))"
+          "$SEVENZIP" --help 2>&1 | head -2 || "$SEVENZIP" 2>&1 | head -2 || true
+          echo "SEVENZIP=$SEVENZIP" >> "$GITHUB_ENV"
 
       - name: Download shinchiro dev build
         run: |
@@ -116,7 +223,9 @@ jobs:
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
 
-          7zz x mpv-dev.7z -ompv-dev-raw
+          # Use whichever 7z binary was found
+          echo "Extracting with: $SEVENZIP"
+          $SEVENZIP x mpv-dev.7z -ompv-dev-raw
 
           echo "=== Raw extraction contents ==="
           find mpv-dev-raw -type f | sort
@@ -132,8 +241,6 @@ jobs:
           fi
 
           echo "Content root: $CONTENT_ROOT"
-          echo ""
-          echo "=== Content root files ==="
           find "$CONTENT_ROOT" -type f | sort
 
           mkdir -p package/lib package/bin package/include/mpv
@@ -163,7 +270,7 @@ jobs:
           echo "=== Validation ==="
 
           if [ ! -f "package/bin/libmpv-2.dll" ] && [ ! -f "package/bin/mpv-2.dll" ]; then
-            echo "FATAL: No DLL found (libmpv-2.dll or mpv-2.dll)"
+            echo "FATAL: No DLL found"
             find "$CONTENT_ROOT" -type f
             exit 1
           fi
@@ -180,19 +287,14 @@ jobs:
             fi
           done
 
-          echo "DLL:"
-          ls -lh package/bin/
-          echo "Import lib:"
-          ls -lh package/lib/
-          echo "Headers:"
-          ls -lh package/include/mpv/
+          echo "DLL:"; ls -lh package/bin/
+          echo "Import lib:"; ls -lh package/lib/
+          echo "Headers:"; ls -lh package/include/mpv/
 
-          # ── Provenance ──
           cp source-url.txt package/
           cp source-tag.txt package/ 2>/dev/null || true
           cp NOTICE.md package/ 2>/dev/null || true
 
-          # ── Tarball ──
           cd package
           find . -print0 | sort -z | \
             tar --create --null --files-from=- \
@@ -201,7 +303,6 @@ jobs:
             | gzip -9n > "../libmpv-windows-${ARCH}.tar.gz"
 
           echo ""
-          echo "=== Final archive ==="
           ls -lh "../libmpv-windows-${ARCH}.tar.gz"
           sha256sum "../libmpv-windows-${ARCH}.tar.gz"
 
