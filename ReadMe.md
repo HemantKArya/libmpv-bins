@@ -37,3 +37,34 @@ cd libmpv-prebuilt
 ./scripts/fetch-deps.sh macos      # macOS arm64 + x86_64
 ./scripts/fetch-deps.sh ios        # iOS arm64 + simulators
 ./scripts/fetch-deps.sh all        # Everything
+
+---
+
+## ⚠️ Android: Critical C++ Runtime Compatibility
+
+**IMPORTANT:** Prebuilt Android libraries are only compatible if your app uses the **same C++ runtime** (libc++) version.
+
+### The Problem
+Each NDK version has a different `libc++` (C++ standard library). If your app's runtime doesn't match the prebuilt libraries, you get runtime crashes:
+```
+UnsatisfiedLinkError: libmpv.so or symbol _ZNSt6__ndk1...
+```
+
+### The Solution (One Line)
+**Always include the `libc++_shared.so` bundled with these libraries in your APK.**
+
+### Quick Check
+1. Extract the Android package: `tar -xzf libmpv-android-arm64-v8a.tar.gz`
+2. Look for: `lib/libc++_shared.so` ✅
+3. Read `META-INF/BUILD_INFO.txt` for NDK version
+4. Ensure your Qt kit or Android build uses the same NDK version
+
+### Full Integration Guide
+See [**ANDROID-CONSUMER-GUIDE.md**](ANDROID-CONSUMER-GUIDE.md) for:
+- ✅ Step-by-step Qt/Android integration
+- ✅ Native Android app integration
+- ✅ Troubleshooting UnsatisfiedLinkError crashes
+- ✅ ABI selection (arm64-v8a, armeabi-v7a, x86_64, x86)
+- ✅ Deployment checklist
+
+---

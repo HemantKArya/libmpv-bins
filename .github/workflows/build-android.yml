@@ -32,6 +32,8 @@ jobs:
           echo "MPV_ANDROID_REPO=$MPV_ANDROID_REPO" >> "$GITHUB_ENV"
           echo "MPV_ANDROID_REF=$MPV_ANDROID_REF" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_VERSION=$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_STL=$ANDROID_STL" >> "$GITHUB_ENV"
 
       - name: Free disk space
         run: |
@@ -106,6 +108,8 @@ jobs:
 
       - name: Build for ${{ matrix.arch }}
         working-directory: mpv-android/buildscripts
+        env:
+          ANDROID_STL: ${{ env.ANDROID_STL }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           echo "Using meson: $(which meson) ($(meson --version))"
@@ -147,6 +151,42 @@ jobs:
             done
           fi
 
+          # ── CRITICAL: Collect libc++_shared.so from NDK ──
+          # This matches the NDK version used to build, avoiding runtime symbol mismatches
+          echo ""
+          echo "=== Including matching libc++_shared.so ==="
+          NDK_LIBC_PATHS=(
+            "mpv-android/buildscripts/sdk/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${ARCH}/libc++_shared.so"
+            "mpv-android/buildscripts/sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${ARCH}/libc++_shared.so"
+            "mpv-android/buildscripts/sdk/android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${ARCH}/libc++_shared.so"
+          )
+
+          FOUND_LIBC=0
+          for pattern in "${NDK_LIBC_PATHS[@]}"; do
+            for libc_path in $pattern; do
+              if [ -f "$libc_path" ]; then
+                echo "  Found libc++_shared.so: $libc_path"
+                cp "$libc_path" package/lib/
+                FOUND_LIBC=1
+                break 2
+              fi
+            done
+          done
+
+          if [ $FOUND_LIBC -eq 0 ]; then
+            echo "  WARNING: libc++_shared.so not found in NDK paths"
+            echo "  Searched patterns:"
+            for pattern in "${NDK_LIBC_PATHS[@]}"; do
+              echo "    - $pattern"
+            done
+            echo "  Available NDK structure:"
+            if [ -d "mpv-android/buildscripts/sdk" ]; then
+              find mpv-android/buildscripts/sdk -name 'libc++_shared.so' -type f 2>/dev/null | head -5 || true
+            fi
+            echo ""
+            echo "  NOTE: Consumers MUST provide matching libc++_shared.so in libs/android/${ABI}/"
+          fi
+
           # ── Collect headers ──
           if [ -d "${PREFIX}/include/mpv" ]; then
             cp "${PREFIX}/include/mpv"/*.h package/include/mpv/
@@ -168,6 +208,47 @@ jobs:
                 -o "package/include/mpv/${hdr}" || true
             done
           fi
+
+          # ── Create BUILD_INFO metadata ──
+          mkdir -p package/META-INF
+          cat > package/META-INF/BUILD_INFO.txt <<EOF
+libmpv-android Build Information
+================================
+
+Build Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+Release Version: $RELEASE_VERSION
+Target ABI: ${ABI}
+Target Architecture: ${ARCH}
+
+C++ Runtime Configuration
+=========================
+NDK Version: $ANDROID_NDK_VERSION
+C++ Standard Library: $ANDROID_STL
+STL Mode: SHARED (libc++_shared.so included in package)
+
+CRITICAL COMPATIBILITY NOTES
+============================
+- This library is built with NDK ${ANDROID_NDK_VERSION} using c++_shared
+- libc++_shared.so is REQUIRED and should be included in your APK
+- Consumers must ship the included libc++_shared.so with their app
+- Using a different libc++ at runtime will cause UnsatisfiedLinkError
+
+For Qt/Android Integration
+===========================
+1. Extract this archive to your Qt project: libs/android/${ABI}/
+2. Ensure libc++_shared.so is present in libs/android/${ABI}/
+3. Qt Creator should automatically include .so files in the APK
+4. Test on device to verify no UnsatisfiedLinkError crashes
+
+For Non-Qt Android Apps
+=======================
+1. Copy .so files to app/src/main/jniLibs/${ABI}/
+2. Copy libc++_shared.so to the same directory
+3. Build and deploy via Gradle
+4. Verify on device
+
+EOF
+          cat package/META-INF/BUILD_INFO.txt
 
           # ── Validate ──
           echo ""
@@ -198,6 +279,10 @@ jobs:
           echo ""
           echo "=== Headers ==="
           ls -lh package/include/mpv/
+
+          echo ""
+          echo "=== Build metadata ==="
+          ls -lh package/META-INF/
 
           cp NOTICE.md package/ 2>/dev/null || true
 
