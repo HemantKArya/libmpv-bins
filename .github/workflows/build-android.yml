@@ -36,13 +36,17 @@ jobs:
           : "${MPV_ANDROID_REF:?MPV_ANDROID_REF not set in versions.env}"
           : "${RELEASE_VERSION:?RELEASE_VERSION not set in versions.env}"
           : "${ANDROID_NDK_VERSION:?ANDROID_NDK_VERSION not set in versions.env}"
+          : "${ANDROID_NDK_PKG_ID:?ANDROID_NDK_PKG_ID not set in versions.env}"
           : "${ANDROID_STL:?ANDROID_STL not set in versions.env}"
 
-          echo "MPV_ANDROID_REPO=$MPV_ANDROID_REPO" >> "$GITHUB_ENV"
-          echo "MPV_ANDROID_REF=$MPV_ANDROID_REF" >> "$GITHUB_ENV"
-          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          echo "MPV_ANDROID_REPO=$MPV_ANDROID_REPO"   >> "$GITHUB_ENV"
+          echo "MPV_ANDROID_REF=$MPV_ANDROID_REF"     >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$RELEASE_VERSION"     >> "$GITHUB_ENV"
           echo "ANDROID_NDK_VERSION=$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-          echo "ANDROID_STL=$ANDROID_STL" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_PKG_ID=$ANDROID_NDK_PKG_ID"   >> "$GITHUB_ENV"
+          echo "ANDROID_STL=$ANDROID_STL"             >> "$GITHUB_ENV"
+
+          echo "Loaded NDK: ${ANDROID_NDK_VERSION} (pkg ${ANDROID_NDK_PKG_ID})"
 
       - name: Free disk space
         run: |
@@ -113,9 +117,98 @@ jobs:
         uses: actions/cache@v4
         with:
           path: mpv-android/buildscripts/sdk
-          key: android-sdk-ndk-${{ runner.os }}-${{ hashFiles('config/versions.env') }}
+          # Cache key includes NDK pkg ID so a version bump busts the cache automatically
+          key: android-sdk-ndk-${{ runner.os }}-${{ env.ANDROID_NDK_PKG_ID }}-${{ hashFiles('config/versions.env') }}
           restore-keys: |
+            android-sdk-ndk-${{ runner.os }}-${{ env.ANDROID_NDK_PKG_ID }}-
             android-sdk-ndk-${{ runner.os }}-
+
+      # ──────────────────────────────────────────────────────
+      # Pre-install the exact NDK declared in versions.env
+      # BEFORE download.sh runs, so it finds it already in
+      # place and skips its own NDK download.
+      #
+      # Download source:
+      #   https://dl.google.com/android/repository/android-ndk-{VERSION}-linux.zip
+      # which extracts to android-ndk-{VERSION}/
+      #
+      # We also symlink it as ndk-bundle so mpv-android's
+      # download.sh picks it up regardless of how it searches.
+      # ──────────────────────────────────────────────────────
+      - name: Pre-install NDK ${{ env.ANDROID_NDK_VERSION }} from versions.env
+        run: |
+          set -euo pipefail
+
+          NDK_VER="${ANDROID_NDK_VERSION}"      # e.g.  r27c
+          NDK_PKG="${ANDROID_NDK_PKG_ID}"       # e.g.  27.2.12479018
+          SDK_DIR="mpv-android/buildscripts/sdk"
+          NDK_DIR="${SDK_DIR}/android-ndk-${NDK_VER}"
+
+          mkdir -p "$SDK_DIR"
+
+          if [ -d "$NDK_DIR" ] && [ -f "${NDK_DIR}/source.properties" ]; then
+            echo "NDK ${NDK_VER} already present (cache hit), verifying..."
+          else
+            echo "NDK ${NDK_VER} not in cache — downloading from Google..."
+            ZIP="android-ndk-${NDK_VER}-linux.zip"
+            URL="https://dl.google.com/android/repository/${ZIP}"
+            TMP="/tmp/${ZIP}"
+
+            echo "URL: ${URL}"
+            curl -L --fail --retry 3 --retry-delay 5 --progress-bar \
+              -o "$TMP" "$URL"
+
+            echo "Extracting ${ZIP}..."
+            unzip -q "$TMP" -d "$SDK_DIR"
+            rm -f "$TMP"
+
+            echo "Extracted:"
+            ls -lh "${SDK_DIR}/"
+          fi
+
+          # ── Verify the installed NDK matches versions.env exactly ──
+          PROPS="${NDK_DIR}/source.properties"
+          if [ ! -f "$PROPS" ]; then
+            echo "FATAL: source.properties not found at ${PROPS}"
+            echo "NDK directory contents:"
+            ls -la "${NDK_DIR}/" 2>/dev/null || echo "(directory missing)"
+            exit 1
+          fi
+
+          ACTUAL_REV=$(grep "^Pkg.Revision" "$PROPS" | cut -d= -f2 | tr -d ' ')
+          echo ""
+          echo "=== NDK Version Check ==="
+          echo "  versions.env ANDROID_NDK_VERSION : ${NDK_VER}"
+          echo "  versions.env ANDROID_NDK_PKG_ID  : ${NDK_PKG}"
+          echo "  source.properties Pkg.Revision   : ${ACTUAL_REV}"
+
+          if [ "$ACTUAL_REV" != "$NDK_PKG" ]; then
+            echo ""
+            echo "FATAL: NDK revision mismatch!"
+            echo "  Expected : ${NDK_PKG}  (from ANDROID_NDK_PKG_ID in versions.env)"
+            echo "  Got      : ${ACTUAL_REV}"
+            echo ""
+            echo "If you changed ANDROID_NDK_VERSION, also update ANDROID_NDK_PKG_ID."
+            echo "Known mappings:"
+            echo "  r27  → 27.0.12077973"
+            echo "  r27b → 27.1.12297006"
+            echo "  r27c → 27.2.12479018"
+            echo "  r28  → 28.0.13004108"
+            echo "  r29  → 29.0.13599879"
+            exit 1
+          fi
+          echo "  ✓ NDK revision matches versions.env"
+
+          # ── Symlink as ndk-bundle so download.sh finds it ──
+          # (download.sh searches for ndk-bundle inside buildscripts/sdk/)
+          ln -sfn "android-ndk-${NDK_VER}" "${SDK_DIR}/ndk-bundle"
+          echo "  ✓ Symlinked as ${SDK_DIR}/ndk-bundle"
+
+          # ── Export the resolved path for later steps ──
+          NDK_PATH="$(pwd)/${NDK_DIR}"
+          echo "NDK_PATH=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo ""
+          echo "NDK ${NDK_VER} ready at: ${NDK_PATH}"
 
       - name: Download sources and SDK
         working-directory: mpv-android/buildscripts
@@ -123,7 +216,54 @@ jobs:
           set -euo pipefail
           echo "Using meson: $(which meson) ($(meson --version))"
           java -version 2>&1 | head -1
+          echo "NDK pre-installed at: ${NDK_PATH}"
           ./download.sh
+
+      # ──────────────────────────────────────────────────────
+      # Post-download guard: confirm download.sh did not
+      # swap out our NDK for a different version.
+      # ──────────────────────────────────────────────────────
+      - name: Verify NDK version was not changed by download.sh
+        run: |
+          set -euo pipefail
+          SDK_DIR="mpv-android/buildscripts/sdk"
+          NDK_VER="${ANDROID_NDK_VERSION}"
+          NDK_PKG="${ANDROID_NDK_PKG_ID}"
+          NDK_DIR="${SDK_DIR}/android-ndk-${NDK_VER}"
+
+          echo "=== Post-download NDK verification ==="
+
+          # Check canonical directory
+          PROPS="${NDK_DIR}/source.properties"
+          if [ ! -f "$PROPS" ]; then
+            echo "FATAL: ${PROPS} missing after download.sh ran."
+            echo "SDK directory contents:"
+            ls -la "${SDK_DIR}/" || true
+            exit 1
+          fi
+
+          ACTUAL_REV=$(grep "^Pkg.Revision" "$PROPS" | cut -d= -f2 | tr -d ' ')
+          echo "  Expected: ${NDK_PKG}"
+          echo "  Actual  : ${ACTUAL_REV}"
+
+          if [ "$ACTUAL_REV" != "$NDK_PKG" ]; then
+            echo ""
+            echo "FATAL: download.sh replaced the NDK!"
+            echo "  Pre-installed : ${NDK_PKG}  (${NDK_VER})"
+            echo "  Now present   : ${ACTUAL_REV}"
+            echo ""
+            echo "This means the pinned mpv-android ref expects a different NDK."
+            echo "Update ANDROID_NDK_VERSION + ANDROID_NDK_PKG_ID in versions.env."
+            exit 1
+          fi
+
+          # Also verify ndk-bundle symlink still points to the right place
+          if [ -L "${SDK_DIR}/ndk-bundle" ]; then
+            TARGET=$(readlink "${SDK_DIR}/ndk-bundle")
+            echo "  ndk-bundle → ${TARGET}"
+          fi
+
+          echo "  ✓ NDK ${NDK_VER} (${NDK_PKG}) confirmed after download.sh"
 
       - name: Build for ${{ matrix.arch }}
         working-directory: mpv-android/buildscripts
@@ -132,6 +272,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Using meson: $(which meson) ($(meson --version))"
+          echo "Using NDK  : ${NDK_PATH}"
 
           # Always pass --arch explicitly to avoid relying on unknown defaults
           ./buildall.sh --arch ${{ matrix.arch }} --clean mpv
@@ -143,6 +284,9 @@ jobs:
           ABI="${{ matrix.abi }}"
           PREFIX="mpv-android/buildscripts/prefix/${ARCH}"
           DEPS_DIR="mpv-android/buildscripts/deps"
+          SDK_DIR="mpv-android/buildscripts/sdk"
+          NDK_VER="${ANDROID_NDK_VERSION}"
+
           case "$ABI" in
             arm64-v8a)
               NDK_TRIPLE="aarch64-linux-android"
@@ -189,16 +333,20 @@ jobs:
             done
           fi
 
-          # ── CRITICAL: Collect libc++_shared.so from NDK ──
+          # ── CRITICAL: Collect libc++_shared.so from the pinned NDK ──
+          # Search order: pinned NDK dir first, then fallback glob patterns.
           echo ""
-          echo "=== Including matching libc++_shared.so ==="
+          echo "=== Including matching libc++_shared.so from NDK ${NDK_VER} ==="
+
+          NDK_ROOT="${SDK_DIR}/android-ndk-${NDK_VER}"
+
           NDK_LIBC_PATHS=(
-            "mpv-android/buildscripts/sdk/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
-            "mpv-android/buildscripts/sdk/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${NDK_ABI_DIR}/libc++_shared.so"
-            "mpv-android/buildscripts/sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
-            "mpv-android/buildscripts/sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${NDK_ABI_DIR}/libc++_shared.so"
-            "mpv-android/buildscripts/sdk/android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
-            "mpv-android/buildscripts/sdk/android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${NDK_ABI_DIR}/libc++_shared.so"
+            "${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
+            "${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${NDK_ABI_DIR}/libc++_shared.so"
+            # Generic fallback patterns (covers cache layouts, symlinks, etc.)
+            "${SDK_DIR}/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
+            "${SDK_DIR}/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
+            "${SDK_DIR}/android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
           )
 
           FOUND_LIBC=0
@@ -220,9 +368,7 @@ jobs:
               echo "    - $pattern"
             done
             echo "  Available NDK structure:"
-            if [ -d "mpv-android/buildscripts/sdk" ]; then
-              find mpv-android/buildscripts/sdk -name 'libc++_shared.so' -type f 2>/dev/null | head -5 || true
-            fi
+            find "${NDK_ROOT}" -name 'libc++_shared.so' -type f 2>/dev/null | head -10 || true
             echo ""
             echo "  FATAL: This package must include libc++_shared.so to be usable by downstream apps"
             exit 1
@@ -263,13 +409,13 @@ jobs:
             echo ""
             echo "C++ Runtime Configuration"
             echo "========================="
-            echo "NDK Version: $ANDROID_NDK_VERSION"
+            echo "NDK Version: $ANDROID_NDK_VERSION  (pkg: $ANDROID_NDK_PKG_ID)"
             echo "C++ Standard Library: $ANDROID_STL"
             echo "STL Mode: SHARED (libc++_shared.so included in package)"
             echo ""
             echo "CRITICAL COMPATIBILITY NOTES"
             echo "============================"
-            echo "- This library is built with NDK $ANDROID_NDK_VERSION using c++_shared"
+            echo "- This library is built with NDK $ANDROID_NDK_VERSION ($ANDROID_NDK_PKG_ID) using c++_shared"
             echo "- libc++_shared.so is REQUIRED and should be included in your APK"
             echo "- Consumers must ship the included libc++_shared.so with their app"
             echo "- Using a different libc++ at runtime will cause UnsatisfiedLinkError"
