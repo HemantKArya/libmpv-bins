@@ -211,53 +211,47 @@ jobs:
 
           # ── Create BUILD_INFO metadata ──
           mkdir -p package/META-INF
-          cat > package/META-INF/BUILD_INFO.txt << 'BUILDEOF'
-libmpv-android Build Information
-================================
-
-Build Date: BUILDDATE_PLACEHOLDER
-Release Version: RELEASE_VERSION_PLACEHOLDER
-Target ABI: ABI_PLACEHOLDER
-Target Architecture: ARCH_PLACEHOLDER
-
-C++ Runtime Configuration
-=========================
-NDK Version: ANDROID_NDK_VERSION_PLACEHOLDER
-C++ Standard Library: ANDROID_STL_PLACEHOLDER
-STL Mode: SHARED (libc++_shared.so included in package)
-
-CRITICAL COMPATIBILITY NOTES
-============================
-- This library is built with NDK ANDROID_NDK_VERSION_PLACEHOLDER using c++_shared
-- libc++_shared.so is REQUIRED and should be included in your APK
-- Consumers must ship the included libc++_shared.so with their app
-- Using a different libc++ at runtime will cause UnsatisfiedLinkError
-
-For Qt/Android Integration
-===========================
-1. Extract this archive to your Qt project: libs/android/ABI_PLACEHOLDER/
-2. Ensure libc++_shared.so is present in libs/android/ABI_PLACEHOLDER/
-3. Qt Creator should automatically include .so files in the APK
-4. Test on device to verify no UnsatisfiedLinkError crashes
-
-For Non-Qt Android Apps
-=======================
-1. Copy .so files to app/src/main/jniLibs/ABI_PLACEHOLDER/
-2. Copy libc++_shared.so to the same directory
-3. Build and deploy via Gradle
-4. Verify on device
-
-BUILDEOF
-
-          # Now substitute the placeholders with actual values
-          sed -i "s/BUILDDATE_PLACEHOLDER/$(date -u +'%Y-%m-%dT%H:%M:%SZ')/g" package/META-INF/BUILD_INFO.txt
-          sed -i "s/RELEASE_VERSION_PLACEHOLDER/$RELEASE_VERSION/g" package/META-INF/BUILD_INFO.txt
-          sed -i "s/ABI_PLACEHOLDER/${ABI}/g" package/META-INF/BUILD_INFO.txt
-          sed -i "s/ARCH_PLACEHOLDER/${ARCH}/g" package/META-INF/BUILD_INFO.txt
-          sed -i "s/ANDROID_NDK_VERSION_PLACEHOLDER/$ANDROID_NDK_VERSION/g" package/META-INF/BUILD_INFO.txt
-          sed -i "s/ANDROID_STL_PLACEHOLDER/$ANDROID_STL/g" package/META-INF/BUILD_INFO.txt
+          {
+            echo "libmpv-android Build Information"
+            echo "================================"
+            echo ""
+            echo "Build Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Release Version: $RELEASE_VERSION"
+            echo "Target ABI: ${ABI}"
+            echo "Target Architecture: ${ARCH}"
+            echo ""
+            echo "C++ Runtime Configuration"
+            echo "========================="
+            echo "NDK Version: $ANDROID_NDK_VERSION"
+            echo "C++ Standard Library: $ANDROID_STL"
+            echo "STL Mode: SHARED (libc++_shared.so included in package)"
+            echo ""
+            echo "CRITICAL COMPATIBILITY NOTES"
+            echo "============================"
+            echo "- This library is built with NDK $ANDROID_NDK_VERSION using c++_shared"
+            echo "- libc++_shared.so is REQUIRED and should be included in your APK"
+            echo "- Consumers must ship the included libc++_shared.so with their app"
+            echo "- Using a different libc++ at runtime will cause UnsatisfiedLinkError"
+            echo ""
+            echo "For Qt/Android Integration"
+            echo "==========================="
+            echo "1. Extract this archive to your Qt project: libs/android/${ABI}/"
+            echo "2. Ensure libc++_shared.so is present in libs/android/${ABI}/"
+            echo "3. Qt Creator should automatically include .so files in the APK"
+            echo "4. Test on device to verify no UnsatisfiedLinkError crashes"
+            echo ""
+            echo "For Non-Qt Android Apps"
+            echo "======================="
+            echo "1. Copy .so files to app/src/main/jniLibs/${ABI}/"
+            echo "2. Copy libc++_shared.so to the same directory"
+            echo "3. Build and deploy via Gradle"
+            echo "4. Verify on device"
+          } > package/META-INF/BUILD_INFO.txt
 
           cat package/META-INF/BUILD_INFO.txt
+
+          # Remove sed substitution lines that are no longer needed
+          # (echo statements already have proper variable expansion)
 
           # ── Validate ──
           echo ""
