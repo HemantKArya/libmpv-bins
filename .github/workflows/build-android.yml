@@ -31,7 +31,6 @@ jobs:
           source config/versions.env
           set +a
 
-          # Validate required variables
           : "${MPV_ANDROID_REPO:?MPV_ANDROID_REPO not set in versions.env}"
           : "${MPV_ANDROID_REF:?MPV_ANDROID_REF not set in versions.env}"
           : "${RELEASE_VERSION:?RELEASE_VERSION not set in versions.env}"
@@ -47,7 +46,7 @@ jobs:
           echo "ANDROID_STL=$ANDROID_STL"                 >> "$GITHUB_ENV"
 
           echo "──────────────────────────────────────"
-          echo "Loaded NDK: ${ANDROID_NDK_VERSION} (pkg ${ANDROID_NDK_PKG_ID})"
+          echo "NDK: ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID})"
           echo "STL: ${ANDROID_STL}"
           echo "──────────────────────────────────────"
 
@@ -77,8 +76,9 @@ jobs:
           javac -version
 
       # ──────────────────────────────────────────────────────
-      # FIX: fontconfig now requires meson >= 1.6.1.
-      # Ubuntu 22.04 ships meson 0.61.2.
+      # Install modern meson + ninja via pip.
+      # NOTE: download.sh may reinstall old apt meson later,
+      # so we re-assert pip versions AFTER download.sh too.
       # ──────────────────────────────────────────────────────
       - name: Install modern meson and ninja via pip
         run: |
@@ -89,6 +89,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "meson: $(meson --version)"
           echo "ninja: $(ninja --version)"
+          echo "meson path: $(which meson)"
 
       - name: Install dependencies
         run: |
@@ -98,6 +99,7 @@ jobs:
             autoconf automake libtool pkg-config \
             python3 python3-pip python3-setuptools python3-jsonschema \
             nasm wget unzip git
+          # NOTE: do NOT install meson or ninja from apt — pip versions are newer
 
       - name: Clone mpv-android
         run: |
@@ -106,15 +108,14 @@ jobs:
             "https://github.com/${MPV_ANDROID_REPO}.git" mpv-android
 
       # ══════════════════════════════════════════════════════
-      # CRITICAL: Patch depinfo.sh to override the NDK version
+      # CRITICAL: Patch depinfo.sh to override NDK version.
       #
-      # mpv-android's include/depinfo.sh defines its own ndkver
-      # (currently r29 on master). We MUST patch this to match
-      # our versions.env BEFORE download.sh runs, because
-      # download.sh reads depinfo.sh to decide which NDK to
-      # install via sdkmanager.
+      # mpv-android's depinfo.sh defines TWO NDK variables:
+      #   v_ndk   = r29              (human label)
+      #   v_ndk_n = 29.0.13599879    (numeric pkg ID)
       #
-      # This is the ONLY reliable way to force a specific NDK.
+      # download.sh validates against v_ndk_n, so we MUST
+      # patch BOTH to match our versions.env.
       # ══════════════════════════════════════════════════════
       - name: Patch depinfo.sh — override NDK to ${{ env.ANDROID_NDK_VERSION }}
         working-directory: mpv-android/buildscripts
@@ -124,85 +125,71 @@ jobs:
           DEPINFO="include/depinfo.sh"
           if [ ! -f "$DEPINFO" ]; then
             echo "FATAL: $DEPINFO not found!"
-            echo "Directory contents:"
             find include/ -type f 2>/dev/null || echo "(include/ missing)"
             exit 1
           fi
 
           echo "=== Original depinfo.sh NDK config ==="
-          grep -n "ndkver\|ndk_ver\|NDK_VERSION\|ndk;" "$DEPINFO" || echo "(no ndkver found)"
+          grep -n "v_ndk\|ndkver\|ndk_ver\|NDK_VERSION" "$DEPINFO" || echo "(no NDK vars found)"
+          echo ""
 
-          # ── Detect the variable name used for NDK version ──
-          # Different mpv-android versions may use different variable names
-          if grep -q "^ndkver=" "$DEPINFO"; then
-            NDK_VAR="ndkver"
-          elif grep -q "^ndk_ver=" "$DEPINFO"; then
-            NDK_VAR="ndk_ver"
-          elif grep -q "^v_ndk=" "$DEPINFO"; then
-            NDK_VAR="v_ndk"
+          # ── Patch v_ndk (human label: r27c) ──
+          if grep -q "^v_ndk=" "$DEPINFO"; then
+            ORIG_VNDK=$(grep "^v_ndk=" "$DEPINFO" | head -1 | cut -d= -f2)
+            echo "Patching v_ndk: ${ORIG_VNDK} → ${ANDROID_NDK_VERSION}"
+            sed -i "s/^v_ndk=.*/v_ndk=${ANDROID_NDK_VERSION}/" "$DEPINFO"
+          elif grep -q "^ndkver=" "$DEPINFO"; then
+            ORIG_VNDK=$(grep "^ndkver=" "$DEPINFO" | head -1 | cut -d= -f2)
+            echo "Patching ndkver: ${ORIG_VNDK} → ${ANDROID_NDK_VERSION}"
+            sed -i "s/^ndkver=.*/ndkver=${ANDROID_NDK_VERSION}/" "$DEPINFO"
           else
-            echo ""
-            echo "WARNING: Could not find NDK version variable in $DEPINFO"
-            echo "Full file contents:"
-            cat "$DEPINFO"
-            echo ""
-            echo "Attempting to add ndkver variable..."
-            # If no NDK variable exists, the script might use sdkmanager directly
-            # We'll add it and also handle the download-sdk.sh path below
-            NDK_VAR="ndkver"
+            echo "WARNING: No v_ndk or ndkver variable found, adding v_ndk..."
+            sed -i "1i v_ndk=${ANDROID_NDK_VERSION}" "$DEPINFO"
           fi
 
-          # ── Patch the NDK version ──
-          ORIGINAL_VER=$(grep "^${NDK_VAR}=" "$DEPINFO" | head -1 | cut -d= -f2)
-          echo ""
-          echo "NDK variable  : ${NDK_VAR}"
-          echo "Original value: ${ORIGINAL_VER:-'(not set)'}"
-          echo "New value     : ${ANDROID_NDK_VERSION}"
-
-          if [ -n "$ORIGINAL_VER" ]; then
-            sed -i "s/^${NDK_VAR}=.*/${NDK_VAR}=${ANDROID_NDK_VERSION}/" "$DEPINFO"
+          # ── Patch v_ndk_n (numeric pkg ID: 27.2.12479018) ──
+          if grep -q "^v_ndk_n=" "$DEPINFO"; then
+            ORIG_VNDK_N=$(grep "^v_ndk_n=" "$DEPINFO" | head -1 | cut -d= -f2)
+            echo "Patching v_ndk_n: ${ORIG_VNDK_N} → ${ANDROID_NDK_PKG_ID}"
+            sed -i "s/^v_ndk_n=.*/v_ndk_n=${ANDROID_NDK_PKG_ID}/" "$DEPINFO"
+          elif grep -q "^ndk_pkg=" "$DEPINFO"; then
+            ORIG_VNDK_N=$(grep "^ndk_pkg=" "$DEPINFO" | head -1 | cut -d= -f2)
+            echo "Patching ndk_pkg: ${ORIG_VNDK_N} → ${ANDROID_NDK_PKG_ID}"
+            sed -i "s/^ndk_pkg=.*/ndk_pkg=${ANDROID_NDK_PKG_ID}/" "$DEPINFO"
           else
-            # Variable didn't exist — prepend it
-            sed -i "1i ${NDK_VAR}=${ANDROID_NDK_VERSION}" "$DEPINFO"
+            echo "WARNING: No v_ndk_n or ndk_pkg variable found, adding v_ndk_n..."
+            # Insert right after v_ndk line
+            sed -i "/^v_ndk=/a v_ndk_n=${ANDROID_NDK_PKG_ID}" "$DEPINFO"
+          fi
+
+          # ── Also patch any hardcoded ndk;XX.X.XXXXXXXX in download scripts ──
+          for script in include/download-sdk.sh download.sh; do
+            if [ -f "$script" ] && grep -q "ndk;[0-9]" "$script"; then
+              echo ""
+              echo "Patching hardcoded NDK pkg ID in $script..."
+              grep -n "ndk;[0-9]" "$script"
+              sed -i "s|ndk;[0-9][0-9]*\.[0-9][0-9]*\.[0-9]*|ndk;${ANDROID_NDK_PKG_ID}|g" "$script"
+              echo "After patch:"
+              grep -n "ndk;[0-9]" "$script"
+            fi
+          done
+
+          # ── Also disable the ci_tarball line that encodes NDK version ──
+          # The ci_tarball variable constructs a URL to download prebuilt deps
+          # for the UPSTREAM NDK version. With our different NDK, that tarball
+          # won't exist, so we must let the build compile deps from source.
+          if grep -q "^ci_tarball=" "$DEPINFO"; then
+            echo ""
+            echo "Disabling ci_tarball (prebuilt cache tied to upstream NDK)..."
+            sed -i 's/^ci_tarball=/#ci_tarball=/' "$DEPINFO"
+            echo "ci_tarball disabled — deps will be built from source"
           fi
 
           echo ""
           echo "=== Patched depinfo.sh NDK config ==="
-          grep -n "ndkver\|ndk_ver\|NDK_VERSION\|ndk;" "$DEPINFO" || true
-
-          # ── Also check/patch download-sdk.sh if it hardcodes an NDK pkg ID ──
-          SDK_SCRIPT="include/download-sdk.sh"
-          if [ -f "$SDK_SCRIPT" ]; then
-            echo ""
-            echo "=== Checking $SDK_SCRIPT for hardcoded NDK ==="
-            grep -n "ndk;" "$SDK_SCRIPT" || echo "(no ndk; references found)"
-
-            # If it contains something like sdkmanager "ndk;29.0.13599879"
-            # we need to replace with our pkg ID
-            if grep -q "ndk;[0-9]" "$SDK_SCRIPT"; then
-              echo "Patching hardcoded NDK pkg ID in $SDK_SCRIPT..."
-              sed -i "s|ndk;[0-9][0-9]*\.[0-9][0-9]*\.[0-9]*|ndk;${ANDROID_NDK_PKG_ID}|g" "$SDK_SCRIPT"
-              echo "Patched:"
-              grep -n "ndk;" "$SDK_SCRIPT"
-            fi
-          fi
-
-          # ── Also check download.sh itself ──
-          if [ -f "download.sh" ]; then
-            echo ""
-            echo "=== Checking download.sh for hardcoded NDK ==="
-            grep -n "ndk;" "download.sh" || echo "(no ndk; references in download.sh)"
-
-            if grep -q "ndk;[0-9]" "download.sh"; then
-              echo "Patching hardcoded NDK pkg ID in download.sh..."
-              sed -i "s|ndk;[0-9][0-9]*\.[0-9][0-9]*\.[0-9]*|ndk;${ANDROID_NDK_PKG_ID}|g" "download.sh"
-              echo "Patched:"
-              grep -n "ndk;" "download.sh"
-            fi
-          fi
-
+          grep -n "v_ndk\|ndkver\|ndk_ver\|ci_tarball" "$DEPINFO" || true
           echo ""
-          echo "✓ NDK version patched to ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID})"
+          echo "✓ NDK patched to ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID})"
 
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
@@ -217,24 +204,56 @@ jobs:
         working-directory: mpv-android/buildscripts
         run: |
           set -euo pipefail
-          echo "Using meson: $(which meson) ($(meson --version))"
-          java -version 2>&1 | head -1
-
-          echo ""
-          echo "=== NDK version in depinfo.sh before download ==="
-          grep "ndkver\|ndk_ver\|v_ndk" include/depinfo.sh || true
+          echo "=== NDK config in depinfo.sh ==="
+          grep "v_ndk\|ndkver" include/depinfo.sh || true
           echo ""
 
           ./download.sh
 
-      # ══════════════════════════════════════════════════════
-      # Post-download verification: confirm the ACTUAL NDK
-      # installed matches what we requested in versions.env.
-      # This catches cases where:
-      #   - Our depinfo.sh patch didn't take effect
-      #   - download.sh has additional hardcoded NDK logic
-      #   - The cache contained a different NDK version
-      # ══════════════════════════════════════════════════════
+      # ──────────────────────────────────────────────────────
+      # download.sh installs its own apt packages including
+      # meson 0.61.2 from Ubuntu repos, which shadows our
+      # pip-installed meson 1.11.x. Re-assert pip versions.
+      # ──────────────────────────────────────────────────────
+      - name: Re-assert modern meson after download.sh
+        run: |
+          set -euo pipefail
+
+          echo "=== Meson version BEFORE fix ==="
+          which meson
+          meson --version
+
+          # Remove apt-installed meson/ninja that download.sh pulled in
+          sudo apt-get remove -y meson ninja-build 2>/dev/null || true
+
+          # Ensure pip versions are on PATH and take priority
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          # Reinstall if somehow removed
+          python3 -m pip install --upgrade meson ninja
+
+          echo ""
+          echo "=== Meson version AFTER fix ==="
+          which meson
+          meson --version
+          which ninja
+          ninja --version
+
+          # Hard fail if meson is still old
+          MESON_VER=$(meson --version)
+          MESON_MAJOR=$(echo "$MESON_VER" | cut -d. -f1)
+          MESON_MINOR=$(echo "$MESON_VER" | cut -d. -f2)
+          if [ "$MESON_MAJOR" -eq 0 ] || { [ "$MESON_MAJOR" -eq 1 ] && [ "$MESON_MINOR" -lt 6 ]; }; then
+            echo "FATAL: meson ${MESON_VER} is too old! fontconfig requires >= 1.6.1"
+            exit 1
+          fi
+          echo "✓ meson ${MESON_VER} is new enough"
+
+      # ──────────────────────────────────────────────────────
+      # Verify the NDK that download.sh installed matches
+      # what we requested in versions.env.
+      # ──────────────────────────────────────────────────────
       - name: Verify NDK version matches versions.env
         working-directory: mpv-android/buildscripts
         run: |
@@ -243,67 +262,47 @@ jobs:
           echo "=== Post-download NDK Verification ==="
           echo ""
 
-          # Find ALL NDKs present in the sdk directory
-          echo "NDK directories found in sdk/:"
-          find sdk/ -name "source.properties" -path "*/ndk*" 2>/dev/null | while read -r props; do
+          # List all NDKs found in sdk/
+          echo "All NDK installations found:"
+          find sdk/ -name "source.properties" 2>/dev/null | while read -r props; do
             rev=$(grep "^Pkg.Revision" "$props" | cut -d= -f2 | tr -d ' ')
             echo "  $props → Pkg.Revision=$rev"
           done
-
-          # Also check android-ndk-* directories
-          find sdk/ -maxdepth 1 -name "android-ndk-*" -type d 2>/dev/null | while read -r d; do
-            if [ -f "$d/source.properties" ]; then
-              rev=$(grep "^Pkg.Revision" "$d/source.properties" | cut -d= -f2 | tr -d ' ')
-              echo "  $d → Pkg.Revision=$rev"
-            else
-              echo "  $d → (no source.properties)"
-            fi
-          done
-
-          # Check ndk-bundle symlink/directory
-          if [ -L "sdk/ndk-bundle" ]; then
-            echo "  sdk/ndk-bundle → $(readlink sdk/ndk-bundle)"
-          elif [ -d "sdk/ndk-bundle" ]; then
-            if [ -f "sdk/ndk-bundle/source.properties" ]; then
-              rev=$(grep "^Pkg.Revision" "sdk/ndk-bundle/source.properties" | cut -d= -f2 | tr -d ' ')
-              echo "  sdk/ndk-bundle → Pkg.Revision=$rev"
-            fi
-          fi
-
           echo ""
 
-          # ── Find the NDK that will actually be used ──
-          # The build scripts typically look for ndk-bundle or android-ndk-rXX
+          # Find the NDK that the build will use
           ACTUAL_NDK_DIR=""
-          ACTUAL_REV=""
 
-          # Priority 1: android-ndk-{our version}
+          # mpv-android typically installs to sdk/android-ndk-rXX/
           if [ -d "sdk/android-ndk-${ANDROID_NDK_VERSION}" ]; then
             ACTUAL_NDK_DIR="sdk/android-ndk-${ANDROID_NDK_VERSION}"
-          # Priority 2: ndk-bundle
-          elif [ -d "sdk/ndk-bundle" ]; then
-            ACTUAL_NDK_DIR="sdk/ndk-bundle"
-          # Priority 3: any android-ndk-* directory
-          else
-            ACTUAL_NDK_DIR=$(find sdk/ -maxdepth 1 -name "android-ndk-*" -type d | head -1)
           fi
 
+          # Or it might use the side-by-side layout: sdk/ndk/VERSION/
           if [ -z "$ACTUAL_NDK_DIR" ]; then
-            # Check side-by-side NDK directories
-            ACTUAL_NDK_DIR=$(find sdk/ -maxdepth 2 -name "source.properties" -path "*/ndk/*" -exec dirname {} \; | head -1)
+            ACTUAL_NDK_DIR=$(find sdk/ -maxdepth 3 -name "source.properties" \
+              -exec grep -l "Pkg.Revision = ${ANDROID_NDK_PKG_ID}" {} \; 2>/dev/null \
+              | head -1 | xargs -r dirname)
+          fi
+
+          # Last resort: find any NDK
+          if [ -z "$ACTUAL_NDK_DIR" ]; then
+            ACTUAL_NDK_DIR=$(find sdk/ -name "source.properties" -exec grep -l "^Pkg.Revision" {} \; \
+              2>/dev/null | head -1 | xargs -r dirname)
           fi
 
           if [ -z "$ACTUAL_NDK_DIR" ] || [ ! -f "${ACTUAL_NDK_DIR}/source.properties" ]; then
             echo "FATAL: No NDK found in sdk/ after download.sh!"
-            echo "SDK directory contents:"
+            echo "SDK contents:"
             ls -la sdk/ 2>/dev/null || echo "(sdk/ missing)"
+            find sdk/ -maxdepth 3 -type d 2>/dev/null || true
             exit 1
           fi
 
           ACTUAL_REV=$(grep "^Pkg.Revision" "${ACTUAL_NDK_DIR}/source.properties" | cut -d= -f2 | tr -d ' ')
 
-          echo "Expected NDK : ${ANDROID_NDK_VERSION} (Pkg.Revision=${ANDROID_NDK_PKG_ID})"
-          echo "Actual NDK   : ${ACTUAL_NDK_DIR} (Pkg.Revision=${ACTUAL_REV})"
+          echo "Expected : ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID})"
+          echo "Actual   : ${ACTUAL_NDK_DIR} (${ACTUAL_REV})"
           echo ""
 
           if [ "$ACTUAL_REV" != "$ANDROID_NDK_PKG_ID" ]; then
@@ -314,21 +313,18 @@ jobs:
             echo "║  Got     : ${ACTUAL_REV}"
             echo "║                                                        ║"
             echo "║  The depinfo.sh patch did not fully take effect.       ║"
-            echo "║  Check if download.sh has additional hardcoded NDK     ║"
-            echo "║  references that need patching.                        ║"
             echo "╚══════════════════════════════════════════════════════════╝"
             echo ""
-            echo "depinfo.sh contents:"
-            cat include/depinfo.sh
+            echo "Current depinfo.sh:"
+            grep "v_ndk\|ndkver" include/depinfo.sh || true
             echo ""
-            echo "download.sh NDK references:"
-            grep -n "ndk" download.sh || true
+            echo "Current download-sdk.sh:"
+            grep "ndk" include/download-sdk.sh 2>/dev/null || true
             exit 1
           fi
 
           echo "✓ NDK ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID}) confirmed!"
 
-          # Export the resolved NDK path for build steps
           NDK_PATH="$(cd "${ACTUAL_NDK_DIR}" && pwd)"
           echo "NDK_PATH=${NDK_PATH}" >> "$GITHUB_ENV"
           echo "NDK_PATH=${NDK_PATH}"
@@ -339,49 +335,40 @@ jobs:
           ANDROID_STL: ${{ env.ANDROID_STL }}
         run: |
           set -euo pipefail
-          echo "Using meson: $(which meson) ($(meson --version))"
-          echo "Using NDK  : ${NDK_PATH}"
+          echo "Using meson : $(which meson) ($(meson --version))"
+          echo "Using NDK   : ${NDK_PATH}"
 
-          # Double-check the NDK that the build toolchain will use
+          # Show the clang that will be used
           CLANG=$(find "${NDK_PATH}" -name "aarch64-linux-android*-clang" -type f | head -1)
           if [ -n "$CLANG" ]; then
-            echo "Clang found: $CLANG"
+            echo "Clang       : $CLANG"
             "$CLANG" --version 2>&1 | head -2 || true
           fi
 
           ./buildall.sh --arch ${{ matrix.arch }} --clean mpv
 
-      # ══════════════════════════════════════════════════════
-      # Post-build: verify the built libmpv.so links against
-      # the correct libc++ (not a newer one)
-      # ══════════════════════════════════════════════════════
       - name: Verify built libraries use correct NDK
         run: |
           set -euo pipefail
-          echo "=== Post-build library verification ==="
+          echo "=== Post-build Library Verification ==="
 
-          # Find the built libmpv.so
           LIBMPV=$(find mpv-android/buildscripts -name "libmpv.so" -type f | head -1)
           if [ -z "$LIBMPV" ]; then
-            echo "WARNING: libmpv.so not found yet, will check during packaging"
+            echo "WARNING: libmpv.so not found yet (will check during packaging)"
           else
             echo "Found: $LIBMPV"
             echo ""
             echo "Dependencies:"
             readelf -d "$LIBMPV" | grep NEEDED || true
             echo ""
-            echo "Checking for problematic symbols..."
-            # The symbol that caused the crash — verify it's NOT present
-            # (it would only be present if built with NDK >= r28 libc++)
+
+            # Check for the symbol that caused the original crash
             if nm -D "$LIBMPV" 2>/dev/null | grep -q "__from_chars_floating_point"; then
-              echo ""
-              echo "WARNING: libmpv.so references __from_chars_floating_point"
-              echo "This symbol requires a newer libc++_shared.so (NDK r28+)"
-              echo "If your Qt uses an older NDK, this WILL crash at runtime!"
-              echo ""
-              echo "NDK used for build: ${ANDROID_NDK_VERSION} (${ANDROID_NDK_PKG_ID})"
+              echo "⚠ WARNING: libmpv.so references __from_chars_floating_point"
+              echo "  This symbol requires a newer libc++_shared.so"
+              echo "  If your Qt uses an older NDK, this WILL crash at runtime!"
             else
-              echo "✓ No __from_chars_floating_point symbol found — safe for older libc++"
+              echo "✓ No __from_chars_floating_point — safe for Qt NDK r27c libc++"
             fi
           fi
 
@@ -392,7 +379,6 @@ jobs:
           ABI="${{ matrix.abi }}"
           PREFIX="mpv-android/buildscripts/prefix/${ARCH}"
           DEPS_DIR="mpv-android/buildscripts/deps"
-          SDK_DIR="mpv-android/buildscripts/sdk"
           NDK_VER="${ANDROID_NDK_VERSION}"
 
           case "$ABI" in
@@ -439,25 +425,20 @@ jobs:
             done
           fi
 
-          # ── CRITICAL: Collect libc++_shared.so from the VERIFIED NDK ──
+          # ── Collect libc++_shared.so from the VERIFIED NDK ──
           echo ""
           echo "=== Including libc++_shared.so from NDK ${NDK_VER} ==="
 
-          # Use the verified NDK_PATH from the verification step
           NDK_LIBC_PATHS=(
             "${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
             "${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/*/lib/linux/${NDK_ABI_DIR}/libc++_shared.so"
-            # Fallback: search any NDK in sdk/
-            "${SDK_DIR}/android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
-            "${SDK_DIR}/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
-            "${SDK_DIR}/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TRIPLE}/libc++_shared.so"
           )
 
           FOUND_LIBC=0
           for pattern in "${NDK_LIBC_PATHS[@]}"; do
             for libc_path in $pattern; do
               if [ -f "$libc_path" ]; then
-                echo "  Found libc++_shared.so: $libc_path"
+                echo "  Found: $libc_path"
                 cp "$libc_path" package/lib/
                 FOUND_LIBC=1
                 break 2
@@ -466,12 +447,18 @@ jobs:
           done
 
           if [ $FOUND_LIBC -eq 0 ]; then
-            echo "  FATAL: libc++_shared.so not found!"
-            echo "  Searched:"
-            for pattern in "${NDK_LIBC_PATHS[@]}"; do
-              echo "    - $pattern"
-            done
-            echo "  All libc++_shared.so in NDK:"
+            echo "  Searching entire NDK for libc++_shared.so..."
+            LIBC_PATH=$(find "${NDK_PATH}" -name "libc++_shared.so" \
+              -path "*/${NDK_TRIPLE}/*" -type f | head -1)
+            if [ -n "$LIBC_PATH" ]; then
+              echo "  Found: $LIBC_PATH"
+              cp "$LIBC_PATH" package/lib/
+              FOUND_LIBC=1
+            fi
+          fi
+
+          if [ $FOUND_LIBC -eq 0 ]; then
+            echo "FATAL: libc++_shared.so not found in NDK!"
             find "${NDK_PATH}" -name 'libc++_shared.so' -type f 2>/dev/null | head -10 || true
             exit 1
           fi
@@ -497,7 +484,7 @@ jobs:
             done
           fi
 
-          # ── Create BUILD_INFO metadata (with VERIFIED info) ──
+          # ── BUILD_INFO metadata (verified) ──
           mkdir -p package/META-INF
           {
             echo "libmpv-android Build Information"
@@ -516,23 +503,15 @@ jobs:
             echo "C++ Standard Library: $ANDROID_STL"
             echo "STL Mode: SHARED (libc++_shared.so included)"
             echo ""
-            echo "IMPORTANT: depinfo.sh was patched to enforce NDK ${ANDROID_NDK_VERSION}"
-            echo "The NDK version was verified AFTER download.sh and AFTER the build."
+            echo "NOTE: depinfo.sh was patched to enforce NDK ${ANDROID_NDK_VERSION}."
+            echo "Both v_ndk and v_ndk_n were overridden before download.sh ran."
+            echo "The NDK version was verified after download and after build."
             echo ""
-            echo "CRITICAL COMPATIBILITY NOTES"
-            echo "============================"
-            echo "- Built with NDK $ANDROID_NDK_VERSION ($ANDROID_NDK_PKG_ID) using c++_shared"
-            echo "- libc++_shared.so MUST be included in your APK"
-            echo "- All native libraries in your app should use the SAME NDK version"
-            echo "- Mixing libc++ versions causes UnsatisfiedLinkError crashes"
-            echo ""
-            echo "For Qt/Android Integration"
-            echo "=========================="
-            echo "- Check your Qt's NDK: look in Qt Creator > Preferences > Android > NDK"
-            echo "- Qt 6.5.x typically uses NDK r25b or r26b"
-            echo "- Qt 6.8+ typically uses NDK r27c"
-            echo "- The NDK used here (${ANDROID_NDK_VERSION}) must match Qt's NDK"
-            echo "- If mismatched, you will get __from_chars_floating_point crashes"
+            echo "COMPATIBILITY"
+            echo "============="
+            echo "- Built with NDK $ANDROID_NDK_VERSION ($ANDROID_NDK_PKG_ID)"
+            echo "- All native libs in your app must use the same libc++_shared.so"
+            echo "- For Qt apps: ensure Qt was also built with NDK $ANDROID_NDK_VERSION"
           } > package/META-INF/BUILD_INFO.txt
 
           cat package/META-INF/BUILD_INFO.txt
@@ -567,7 +546,7 @@ jobs:
           echo "=== Headers ==="
           ls -lh package/include/mpv/
 
-          cp NOTICE.md package/ 2>/dev/null || echo "INFO: NOTICE.md not found in repo root, skipping."
+          cp NOTICE.md package/ 2>/dev/null || echo "INFO: NOTICE.md not found, skipping."
 
           cd package
           find . -print0 | sort -z | \
@@ -580,7 +559,6 @@ jobs:
           echo "=== Final archive ==="
           ls -lh "../libmpv-android-${ABI}.tar.gz"
           sha256sum "../libmpv-android-${ABI}.tar.gz"
-          echo ""
           tar -tzf "../libmpv-android-${ABI}.tar.gz"
 
       - uses: actions/upload-artifact@v4
