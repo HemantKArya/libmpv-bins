@@ -23,6 +23,7 @@ jobs:
       - name: Load versions
         run: |
           set -euo pipefail
+          tr -d '\r' < config/versions.env > /tmp/versions.env && cp /tmp/versions.env config/versions.env
           set -a; source config/versions.env; set +a
           echo "FFMPEG_ANDROID_MAKER_REPO=${FFMPEG_ANDROID_MAKER_REPO:-Javernaut/ffmpeg-android-maker}" >> "$GITHUB_ENV"
           echo "FFMPEG_ANDROID_MAKER_REF=${FFMPEG_ANDROID_MAKER_REF:-v2.12}" >> "$GITHUB_ENV"

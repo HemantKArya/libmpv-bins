@@ -35,6 +35,7 @@ jobs:
       - name: Load versions
         run: |
           set -euo pipefail
+          tr -d '\r' < config/versions.env > /tmp/versions.env && cp /tmp/versions.env config/versions.env
           set -a; source config/versions.env; set +a
           VARIANT="${{ inputs.variant }}"
           if [ -z "$VARIANT" ]; then

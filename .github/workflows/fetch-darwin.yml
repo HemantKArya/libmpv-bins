@@ -47,6 +47,7 @@ jobs:
 
       - name: Load versions
         run: |
+          tr -d '\r' < config/versions.env > /tmp/versions.env && cp /tmp/versions.env config/versions.env
           set -a; source config/versions.env; set +a
           echo "DARWIN_REPO=$DARWIN_REPO" >> "$GITHUB_ENV"
           echo "DARWIN_TAG=$DARWIN_TAG" >> "$GITHUB_ENV"

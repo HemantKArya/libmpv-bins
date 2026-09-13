@@ -6,6 +6,7 @@ on:
       version:
         description: 'Release version (e.g. 7.1.1 or 2026.04.26)'
         required: true
+        default: '7.1.1'
         type: string
       variant:
         description: 'BtbN variant for Windows and Linux (gpl-shared or lgpl-shared)'
