@@ -1,0 +1,170 @@
+name: Build macOS FFmpeg
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -euo pipefail
+          set -a; source config/versions.env; set +a
+          echo "FFMPEG_SOURCE_BRANCH=${FFMPEG_SOURCE_BRANCH:-release/7.1}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          brew install nasm pkg-config
+
+      - name: Clone FFmpeg repository
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FFMPEG_SOURCE_BRANCH" \
+            https://github.com/FFmpeg/FFmpeg.git src
+
+      - name: Build arm64 slice
+        run: |
+          set -euo pipefail
+          mkdir -p build-arm64
+          cd build-arm64
+
+          ../src/configure \
+            --prefix="$PWD/dist" \
+            --enable-shared \
+            --disable-static \
+            --enable-pic \
+            --arch=arm64 \
+            --cc="clang" \
+            --extra-cflags="-arch arm64 -mmacosx-version-min=11.0" \
+            --extra-ldflags="-arch arm64 -mmacosx-version-min=11.0" \
+            --disable-programs \
+            --disable-doc
+
+          make -j$(sysctl -n hw.logicalcpu)
+          make install
+
+      - name: Build x86_64 slice
+        run: |
+          set -euo pipefail
+          mkdir -p build-x86_64
+          cd build-x86_64
+
+          ../src/configure \
+            --prefix="$PWD/dist" \
+            --enable-shared \
+            --disable-static \
+            --enable-pic \
+            --arch=x86_64 \
+            --enable-cross-compile \
+            --target-os=darwin \
+            --cc="clang" \
+            --extra-cflags="-arch x86_64 -mmacosx-version-min=11.0" \
+            --extra-ldflags="-arch x86_64 -mmacosx-version-min=11.0" \
+            --disable-programs \
+            --disable-doc
+
+          make -j$(sysctl -n hw.logicalcpu)
+          make install
+
+      - name: Lipo merge into Universal binaries
+        run: |
+          set -euo pipefail
+          mkdir -p universal/lib universal/include
+          cp -r build-arm64/dist/include/* universal/include/
+
+          # Copy pkgconfig
+          if [ -d "build-arm64/dist/lib/pkgconfig" ]; then
+            mkdir -p universal/lib/pkgconfig
+            cp -r build-arm64/dist/lib/pkgconfig/* universal/lib/pkgconfig/
+          fi
+
+          echo "Merging dylibs with lipo..."
+          for f in build-arm64/dist/lib/*.dylib; do
+            [ -e "$f" ] || continue
+            BNAME=$(basename "$f")
+
+            if [ -L "$f" ]; then
+              # Preserve symlink structure
+              TARGET=$(readlink "$f")
+              ln -sf "$TARGET" "universal/lib/$BNAME"
+              echo "Symlink: $BNAME -> $TARGET"
+            else
+              lipo -create "build-arm64/dist/lib/$BNAME" "build-x86_64/dist/lib/$BNAME" -output "universal/lib/$BNAME"
+              echo "Created fat binary: $BNAME"
+            fi
+          done
+
+          [ -f NOTICE.md ] && cp NOTICE.md universal/ || true
+
+      - name: Validate Universal binaries
+        run: |
+          set -euo pipefail
+          echo "=== Universal Dylib Architecture Check ==="
+          for dylib in universal/lib/*.dylib; do
+            [ -f "$dylib" ] && [ ! -L "$dylib" ] || continue
+            echo "Inspecting: $dylib"
+            lipo -info "$dylib"
+          done
+
+          echo "=== Header Check ==="
+          test -f universal/include/libavcodec/avcodec.h
+          test -f universal/include/libavformat/avformat.h
+          test -f universal/include/libavutil/avutil.h
+          echo "All required headers verified."
+
+      - name: Package archives
+        run: |
+          set -euo pipefail
+
+          package_dir() {
+            local src_dir="$1"
+            local tar_name="$2"
+            cd "$src_dir"
+            find . -print0 | sort -z | \
+              tar --create --null --files-from=- \
+                  --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                  --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              | gzip -9n > "../../${tar_name}"
+            cd ../..
+            ls -lh "${tar_name}"
+            sha256sum "${tar_name}"
+          }
+
+          package_dir universal ffmpeg-macos-universal.tar.gz
+
+          # Also package per-arch dist directories
+          [ -f NOTICE.md ] && cp NOTICE.md build-arm64/dist/ || true
+          [ -f NOTICE.md ] && cp NOTICE.md build-x86_64/dist/ || true
+          package_dir build-arm64/dist ffmpeg-macos-arm64.tar.gz
+          package_dir build-x86_64/dist ffmpeg-macos-x86_64.tar.gz
+
+      - name: Upload Universal macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-universal
+          path: ffmpeg-macos-universal.tar.gz
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Upload arm64 macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-arm64
+          path: ffmpeg-macos-arm64.tar.gz
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Upload x86_64 macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-x86_64
+          path: ffmpeg-macos-x86_64.tar.gz
+          retention-days: 5
+          if-no-files-found: error

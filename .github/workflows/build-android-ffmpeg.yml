@@ -1,0 +1,150 @@
+name: Build Android FFmpeg
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - x86
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -euo pipefail
+          set -a; source config/versions.env; set +a
+          echo "FFMPEG_ANDROID_MAKER_REPO=${FFMPEG_ANDROID_MAKER_REPO:-Javernaut/ffmpeg-android-maker}" >> "$GITHUB_ENV"
+          echo "FFMPEG_ANDROID_MAKER_REF=${FFMPEG_ANDROID_MAKER_REF:-v2.12}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_VERSION=${ANDROID_NDK_VERSION:-r27c}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_PKG_ID=${ANDROID_NDK_PKG_ID:-27.2.12479018}" >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            meson nasm ninja-build autoconf automake libtool pkg-config
+
+      - name: Setup Android NDK
+        run: |
+          set -euo pipefail
+          echo "Checking available NDK installations..."
+          ls -la "$ANDROID_HOME/ndk" 2>/dev/null || true
+
+          TARGET_NDK_DIR="$ANDROID_HOME/ndk/${ANDROID_NDK_PKG_ID}"
+          if [ -d "$TARGET_NDK_DIR" ]; then
+            echo "Using exact matching NDK: $TARGET_NDK_DIR"
+            echo "ANDROID_NDK_HOME=$TARGET_NDK_DIR" >> "$GITHUB_ENV"
+          elif [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            echo "Using latest NDK: $ANDROID_NDK_LATEST_HOME"
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          else
+            echo "Installing NDK ${ANDROID_NDK_PKG_ID} via sdkmanager..."
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_PKG_ID}" || \
+            yes | "$ANDROID_HOME/tools/bin/sdkmanager" --install "ndk;${ANDROID_NDK_PKG_ID}"
+            echo "ANDROID_NDK_HOME=$TARGET_NDK_DIR" >> "$GITHUB_ENV"
+          fi
+          echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Clone ffmpeg-android-maker
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FFMPEG_ANDROID_MAKER_REF" \
+            "https://github.com/${FFMPEG_ANDROID_MAKER_REPO}.git" maker
+
+      - name: Build FFmpeg for ${{ matrix.abi }}
+        working-directory: maker
+        run: |
+          set -euo pipefail
+          echo "SDK Home: $ANDROID_SDK_HOME"
+          echo "NDK Home: $ANDROID_NDK_HOME"
+
+          # Execute build for the specific ABI
+          ./ffmpeg-android-maker.sh -android=24 -abis=${{ matrix.abi }}
+
+      - name: Collect and package
+        run: |
+          set -euo pipefail
+          ABI="${{ matrix.abi }}"
+          mkdir -p package/lib package/include
+
+          echo "=== Output directory from builder ==="
+          find maker/output -type f | sort
+
+          # Copy shared libraries
+          if [ -d "maker/output/lib/${ABI}" ]; then
+            cp -a maker/output/lib/${ABI}/*.so package/lib/
+          elif [ -d "maker/build/ffmpeg/${ABI}/lib" ]; then
+            cp -a maker/build/ffmpeg/${ABI}/lib/*.so package/lib/
+          fi
+
+          # Copy headers
+          if [ -d "maker/output/include/${ABI}" ]; then
+            cp -r maker/output/include/${ABI}/* package/include/
+          elif [ -d "maker/build/ffmpeg/${ABI}/include" ]; then
+            cp -r maker/build/ffmpeg/${ABI}/include/* package/include/
+          fi
+
+          [ -f NOTICE.md ] && cp NOTICE.md package/ || true
+
+          # ── Validate ──
+          echo "=== Validating ${{ matrix.abi }} build ==="
+          SO_COUNT=$(find package/lib -name '*.so' | wc -l)
+          echo "Found .so files ($SO_COUNT):"
+          ls -lh package/lib/*.so
+
+          if [ "$SO_COUNT" -eq 0 ]; then
+            echo "FATAL: No .so files found for ABI ${ABI}!"
+            exit 1
+          fi
+
+          for lib in libavcodec libavformat libavutil; do
+            if [ ! -f "package/lib/${lib}.so" ]; then
+              echo "FATAL: Missing required library: ${lib}.so"
+              exit 1
+            fi
+          done
+
+          # Check headers
+          if [ ! -d "package/include/libavcodec" ] && [ ! -f "package/include/avcodec.h" ]; then
+            echo "FATAL: Headers missing in package/include!"
+            exit 1
+          fi
+
+          # Verify ELF machine architecture and 16KB alignment
+          echo "ELF check:"
+          readelf -h package/lib/libavcodec.so | grep -E "Class|Machine" || true
+          echo "Segment alignment check (16KB check):"
+          readelf -l package/lib/libavcodec.so | grep -A 1 LOAD | head -4 || true
+
+          OUTPUT_FILE="ffmpeg-android-${ABI}.tar.gz"
+          cd package
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../${OUTPUT_FILE}"
+
+          cd ..
+          echo "Created ${OUTPUT_FILE}:"
+          ls -lh "${OUTPUT_FILE}"
+          sha256sum "${OUTPUT_FILE}"
+
+      - name: Upload Android FFmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-${{ matrix.abi }}
+          path: ffmpeg-android-${{ matrix.abi }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error

@@ -1,0 +1,102 @@
+name: Build iOS FFmpeg
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  ios:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -euo pipefail
+          set -a; source config/versions.env; set +a
+          echo "FFMPEG_IOS_REPO=${FFMPEG_IOS_REPO:-kewlbear/FFmpeg-iOS}" >> "$GITHUB_ENV"
+          echo "FFMPEG_IOS_REF=${FFMPEG_IOS_REF:-tool}" >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew install nasm pkg-config
+
+      - name: Clone kewlbear/FFmpeg-iOS tool branch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FFMPEG_IOS_REF" \
+            "https://github.com/${FFMPEG_IOS_REPO}.git" tool
+
+      - name: Build FFmpeg XCFrameworks
+        working-directory: tool
+        run: |
+          set -euo pipefail
+          echo "Building iOS XCFrameworks via Swift CLI..."
+          swift run ffmpeg-ios build --library avcodec,avformat,avutil,swscale,swresample,avfilter
+
+      - name: Collect and validate XCFrameworks
+        run: |
+          set -euo pipefail
+          mkdir -p package/Frameworks package/include
+
+          echo "=== Built Frameworks ==="
+          ls -la tool/Frameworks/ || find tool -name '*.xcframework'
+
+          # Find and copy all .xcframework bundles
+          find tool -name '*.xcframework' -maxdepth 2 -type d -exec cp -R {} package/Frameworks/ \;
+
+          # Extract headers into package/include for C/C++ direct consumer access
+          find package/Frameworks -name 'Headers' -type d | while read -r hdr_dir; do
+            FW_NAME=$(basename "$(dirname "$hdr_dir")" .xcframework)
+            mkdir -p "package/include/lib${FW_NAME}"
+            cp -R "$hdr_dir"/* "package/include/lib${FW_NAME}/" 2>/dev/null || true
+          done
+
+          [ -f NOTICE.md ] && cp NOTICE.md package/ || true
+
+          # ── Validate ──
+          echo "=== Validating XCFrameworks ==="
+          FW_COUNT=$(find package/Frameworks -maxdepth 1 -name '*.xcframework' | wc -l)
+          echo "Total xcframeworks: $FW_COUNT"
+
+          if [ "$FW_COUNT" -eq 0 ]; then
+            echo "FATAL: No .xcframework bundles found!"
+            exit 1
+          fi
+
+          for fw in avcodec avformat avutil; do
+            if [ ! -d "package/Frameworks/${fw}.xcframework" ]; then
+              echo "FATAL: Missing required framework: ${fw}.xcframework"
+              exit 1
+            fi
+          done
+
+          echo "Inspecting avcodec slices:"
+          find package/Frameworks/avcodec.xcframework -name '*.a' -o -name 'avcodec' | while read -r bin; do
+            echo "Slice $bin:"
+            file "$bin" || true
+          done
+
+          OUTPUT_FILE="ffmpeg-ios-xcframeworks.tar.gz"
+          cd package
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../${OUTPUT_FILE}"
+
+          cd ..
+          echo "Created ${OUTPUT_FILE}:"
+          ls -lh "${OUTPUT_FILE}"
+          sha256sum "${OUTPUT_FILE}"
+
+      - name: Upload iOS FFmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-ios-xcframeworks
+          path: ffmpeg-ios-xcframeworks.tar.gz
+          retention-days: 5
+          if-no-files-found: error

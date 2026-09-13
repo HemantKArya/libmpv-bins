@@ -1,0 +1,206 @@
+name: Release FFmpeg
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 7.1.1 or 2026.04.26)'
+        required: true
+        type: string
+      variant:
+        description: 'BtbN variant for Windows and Linux (gpl-shared or lgpl-shared)'
+        required: false
+        default: 'gpl-shared'
+        type: string
+      skip_windows:
+        description: 'Skip Windows fetch'
+        required: false
+        type: boolean
+        default: false
+      skip_linux:
+        description: 'Skip Linux fetch'
+        required: false
+        type: boolean
+        default: false
+      skip_android:
+        description: 'Skip Android build'
+        required: false
+        type: boolean
+        default: false
+      skip_macos:
+        description: 'Skip macOS build'
+        required: false
+        type: boolean
+        default: false
+      skip_ios:
+        description: 'Skip iOS build'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ffmpeg
+  cancel-in-progress: false
+
+jobs:
+  # ══════════════════════════════════════
+  # 1. Fetch / Build platforms
+  # ══════════════════════════════════════
+  fetch-windows-ffmpeg:
+    if: ${{ !inputs.skip_windows }}
+    uses: ./.github/workflows/fetch-windows-ffmpeg.yml
+    with:
+      variant: ${{ inputs.variant }}
+
+  fetch-linux-ffmpeg:
+    if: ${{ !inputs.skip_linux }}
+    uses: ./.github/workflows/fetch-linux-ffmpeg.yml
+    with:
+      variant: ${{ inputs.variant }}
+
+  build-android-ffmpeg:
+    if: ${{ !inputs.skip_android }}
+    uses: ./.github/workflows/build-android-ffmpeg.yml
+
+  build-macos-ffmpeg:
+    if: ${{ !inputs.skip_macos }}
+    uses: ./.github/workflows/build-macos-ffmpeg.yml
+
+  build-ios-ffmpeg:
+    if: ${{ !inputs.skip_ios }}
+    uses: ./.github/workflows/build-ios-ffmpeg.yml
+
+  # ══════════════════════════════════════
+  # 2. Collect and release
+  # ══════════════════════════════════════
+  release:
+    needs:
+      - fetch-windows-ffmpeg
+      - fetch-linux-ffmpeg
+      - build-android-ffmpeg
+      - build-macos-ffmpeg
+      - build-ios-ffmpeg
+    if: |
+      always() && !cancelled() &&
+      (needs.fetch-windows-ffmpeg.result == 'success' ||
+       needs.fetch-linux-ffmpeg.result == 'success' ||
+       needs.build-android-ffmpeg.result == 'success' ||
+       needs.build-macos-ffmpeg.result == 'success' ||
+       needs.build-ios-ffmpeg.result == 'success')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all FFmpeg artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: ffmpeg-*
+
+      - name: Collect archives and generate checksums
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          echo "=== All downloaded artifacts ==="
+          find artifacts/ -type f | sort
+
+          # Copy all tarballs into release/
+          find artifacts/ -name '*.tar.gz' -exec cp {} release/ \;
+
+          TOTAL=$(ls release/*.tar.gz 2>/dev/null | wc -l)
+          echo "Total archives collected: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "FATAL: No archives found!"
+            find artifacts/ -type f || true
+            exit 1
+          fi
+
+          cd release
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS.txt
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS.txt
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ inputs.version }}"
+          VARIANT="${{ inputs.variant }}"
+
+          cat > release_body.md <<EOF
+          ## FFmpeg Shared Libraries v${VERSION} (${VARIANT})
+
+          Prebuilt cross-platform FFmpeg shared libraries and development headers.
+          Verified checksums included in \`SHA256SUMS.txt\`.
+
+          ### Available Archives
+
+          | Platform | Target / Arch | Archive | Size |
+          |---|---|---|---|
+          EOF
+
+          for f in release/ffmpeg-*.tar.gz; do
+            [ -f "$f" ] || continue
+            BASENAME=$(basename "$f")
+            SIZE=$(du -h "$f" | cut -f1)
+
+            NAME_NO_EXT=$(echo "$BASENAME" | sed 's/.tar.gz//')
+            PLATFORM_ARCH=$(echo "$NAME_NO_EXT" | sed 's/^ffmpeg-//')
+
+            case "$PLATFORM_ARCH" in
+              windows-x86_64)       PLATFORM="Windows"; ARCH="x86_64" ;;
+              windows-aarch64)      PLATFORM="Windows"; ARCH="ARM64" ;;
+              linux-x86_64)         PLATFORM="Linux"; ARCH="x86_64" ;;
+              linux-aarch64)        PLATFORM="Linux"; ARCH="ARM64" ;;
+              android-arm64-v8a)    PLATFORM="Android"; ARCH="arm64-v8a" ;;
+              android-armeabi-v7a)  PLATFORM="Android"; ARCH="armeabi-v7a" ;;
+              android-x86_64)       PLATFORM="Android"; ARCH="x86_64" ;;
+              android-x86)          PLATFORM="Android"; ARCH="x86" ;;
+              macos-universal)      PLATFORM="macOS"; ARCH="Universal (arm64 + x86_64)" ;;
+              macos-arm64)          PLATFORM="macOS"; ARCH="arm64" ;;
+              macos-x86_64)         PLATFORM="macOS"; ARCH="x86_64" ;;
+              ios-xcframeworks)     PLATFORM="iOS"; ARCH="XCFrameworks (device + simulator)" ;;
+              *)                    PLATFORM="$PLATFORM_ARCH"; ARCH="-" ;;
+            esac
+
+            echo "| ${PLATFORM} | ${ARCH} | \`${BASENAME}\` | ${SIZE} |" >> release_body.md
+          done
+
+          cat >> release_body.md <<'EOF'
+
+          ### Build Sources
+          | Platform | Build Method | Source |
+          |---|---|---|
+          | Windows | Official Prebuilt (shared) | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) |
+          | Linux | Official Prebuilt (shared) | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) |
+          | Android | Source compiled (16KB page aligned) | [Javernaut/ffmpeg-android-maker](https://github.com/Javernaut/ffmpeg-android-maker) |
+          | macOS | Source compiled (arm64 + x86_64 lipo) | [FFmpeg official source](https://github.com/FFmpeg/FFmpeg) |
+          | iOS | Source compiled (.xcframework) | [kewlbear/FFmpeg-iOS](https://github.com/kewlbear/FFmpeg-iOS) |
+
+          ### Verification
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+          EOF
+
+          echo "=== Release body ==="
+          cat release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "ffmpeg-v${{ inputs.version }}"
+          name: "FFmpeg v${{ inputs.version }}"
+          body_path: release_body.md
+          draft: false
+          prerelease: false
+          files: |
+            release/ffmpeg-*.tar.gz
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true

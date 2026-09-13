@@ -1,0 +1,195 @@
+name: Fetch Linux FFmpeg
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'FFmpeg build variant (gpl-shared or lgpl-shared)'
+        required: false
+        default: 'gpl-shared'
+        type: string
+  workflow_call:
+    inputs:
+      variant:
+        description: 'FFmpeg build variant (gpl-shared or lgpl-shared)'
+        required: false
+        default: 'gpl-shared'
+        type: string
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: linux64
+          - arch: aarch64
+            target: linuxarm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions
+        run: |
+          set -euo pipefail
+          set -a; source config/versions.env; set +a
+          VARIANT="${{ inputs.variant }}"
+          if [ -z "$VARIANT" ]; then
+            VARIANT="${FFMPEG_BTBN_VARIANT:-gpl-shared}"
+          fi
+          echo "FFMPEG_BTBN_REPO=${FFMPEG_BTBN_REPO:-BtbN/FFmpeg-Builds}" >> "$GITHUB_ENV"
+          echo "FFMPEG_BTBN_TAG=${FFMPEG_BTBN_TAG:-latest}" >> "$GITHUB_ENV"
+          echo "FFMPEG_VARIANT=${VARIANT}" >> "$GITHUB_ENV"
+
+      - name: Locate and download BtbN Linux archive
+        run: |
+          set -euo pipefail
+          REPO="${FFMPEG_BTBN_REPO}"
+          TAG="${FFMPEG_BTBN_TAG}"
+          TARGET="${{ matrix.target }}"
+          VARIANT="${FFMPEG_VARIANT}"
+
+          if [ "$TAG" = "latest" ]; then
+            API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+          else
+            API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+          fi
+
+          echo "Querying release API: $API_URL"
+          RELEASE_JSON=$(curl -sS -H "Accept: application/vnd.github+json" "$API_URL")
+
+          PATTERN="${TARGET}-${VARIANT}"
+          echo "Searching for asset matching pattern: ${PATTERN}"
+
+          ASSET_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          target = '${TARGET}'
+          variant = '${VARIANT}'
+          pattern = f'{target}-{variant}'
+          for asset in data.get('assets', []):
+              name = asset.get('name', '')
+              if pattern in name and name.endswith('.tar.xz'):
+                  print(asset.get('browser_download_url', ''))
+                  break
+          " || true)
+
+          if [ -z "$ASSET_URL" ]; then
+            ASSET_URL="https://github.com/${REPO}/releases/download/${TAG}/ffmpeg-master-latest-${TARGET}-${VARIANT}.tar.xz"
+            echo "Falling back to standard direct URL: $ASSET_URL"
+          fi
+
+          echo "Downloading: $ASSET_URL"
+          curl -L --fail --retry 3 --progress-bar -o ffmpeg-linux.tar.xz "$ASSET_URL"
+          ls -lh ffmpeg-linux.tar.xz
+          echo "$ASSET_URL" > source-url.txt
+
+      - name: Extract and repackage
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.arch }}"
+
+          mkdir -p raw package/bin package/lib package/include
+          tar -xf ffmpeg-linux.tar.xz -C raw
+
+          echo "=== Extracted root structure ==="
+          ls -la raw/
+
+          ROOT_DIR=$(find raw -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [ -z "$ROOT_DIR" ]; then
+            ROOT_DIR="raw"
+          fi
+
+          echo "Package root: $ROOT_DIR"
+          find "$ROOT_DIR" -maxdepth 3
+
+          # 1. Binaries
+          if [ -d "$ROOT_DIR/bin" ]; then
+            cp -a "$ROOT_DIR/bin"/* package/bin/
+          fi
+
+          # 2. Shared libraries
+          if [ -d "$ROOT_DIR/lib" ]; then
+            cp -a "$ROOT_DIR/lib"/* package/lib/
+          fi
+
+          # 3. Include headers
+          if [ -d "$ROOT_DIR/include" ]; then
+            cp -r "$ROOT_DIR/include"/* package/include/
+          fi
+
+          # 4. Licenses & docs
+          find "$ROOT_DIR" -maxdepth 2 \( -iname '*license*' -o -iname '*copying*' \) -type f -exec cp {} package/ \; 2>/dev/null || true
+          [ -f NOTICE.md ] && cp NOTICE.md package/ || true
+          cp source-url.txt package/
+
+          # ── Setup symlinks for unversioned .so if needed ──
+          cd package/lib
+          for sofile in lib*.so.*.*.*; do
+            [ -f "$sofile" ] || continue
+            # e.g. libavcodec.so.61.19.100 -> libavcodec.so.61 and libavcodec.so
+            LIBNAME=$(echo "$sofile" | sed -E 's/(lib[a-z]+)\.so\..*/\1/')
+            MAJOR=$(echo "$sofile" | sed -E 's/lib[a-z]+\.so\.([0-9]+)\..*/\1/')
+            if [ -n "$MAJOR" ] && [ ! -L "${LIBNAME}.so.${MAJOR}" ]; then
+              ln -sf "$sofile" "${LIBNAME}.so.${MAJOR}"
+            fi
+            if [ ! -L "${LIBNAME}.so" ]; then
+              ln -sf "${LIBNAME}.so.${MAJOR}" "${LIBNAME}.so"
+            fi
+          done
+          cd ../..
+
+          # ── Validation ──
+          echo "=== Validating package ==="
+          SO_COUNT=$(find package/lib -name '*.so*' | wc -l)
+          echo "Found SOs ($SO_COUNT):"
+          ls -la package/lib/*.so*
+
+          if [ "$SO_COUNT" -eq 0 ]; then
+            echo "FATAL: No shared libraries found in package/lib!"
+            exit 1
+          fi
+
+          if [ ! -f package/include/libavcodec/avcodec.h ] && [ ! -f package/include/avcodec.h ]; then
+            echo "FATAL: libavcodec header missing in package/include!"
+            exit 1
+          fi
+
+          if [ ! -f package/include/libavformat/avformat.h ] && [ ! -f package/include/avformat.h ]; then
+            echo "FATAL: libavformat header missing in package/include!"
+            exit 1
+          fi
+
+          if [ ! -f package/include/libavutil/avutil.h ] && [ ! -f package/include/avutil.h ]; then
+            echo "FATAL: libavutil header missing in package/include!"
+            exit 1
+          fi
+
+          echo "Architecture check:"
+          file package/lib/libavcodec.so* | head -3
+
+          echo "Validation PASSED."
+
+          OUTPUT_FILE="ffmpeg-linux-${ARCH}.tar.gz"
+          cd package
+          find . -print0 | sort -z | \
+            tar --create --null --files-from=- \
+                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            | gzip -9n > "../${OUTPUT_FILE}"
+
+          cd ..
+          echo "Created ${OUTPUT_FILE}:"
+          ls -lh "${OUTPUT_FILE}"
+          sha256sum "${OUTPUT_FILE}"
+
+      - name: Upload Linux FFmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-linux-${{ matrix.arch }}
+          path: ffmpeg-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error
