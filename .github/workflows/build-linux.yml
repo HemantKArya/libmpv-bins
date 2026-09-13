@@ -67,10 +67,10 @@ jobs:
             libvdpau-dev libva-dev \
             libarchive-dev \
             libbluray-dev libdvdnav-dev \
-            python3 python3-pip python3-jinja2 python3-docutils
+            python3 python3-pip python3-jinja2
 
-          # Explicitly remove vulkan headers if somehow present
-          sudo apt-get remove -y libvulkan-dev 2>/dev/null || true
+          # Explicitly remove vulkan headers and docutils if somehow present
+          sudo apt-get remove -y libvulkan-dev python3-docutils 2>/dev/null || true
 
           # NOTE: NO libvulkan-dev — avoids Vulkan header version mismatch
           # NOTE: NO meson or ninja-build from apt — we use pip versions
@@ -108,9 +108,13 @@ jobs:
           --disable-vulkan
           EOF
 
-          # mpv: build shared libmpv, no player binary
+          # mpv: build shared libmpv, no player binary, no manpages
           cat > mpv_options <<'EOF'
           -Dlibmpv=true
+          -Dcplayer=false
+          -Dmanpage-build=disabled
+          -Dhtml-build=disabled
+          -Dpdf-build=disabled
           -Dbuild-date=false
           EOF
 
