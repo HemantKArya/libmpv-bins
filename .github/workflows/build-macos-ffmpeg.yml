@@ -102,6 +102,11 @@ jobs:
             fi
           done
 
+          # Strip local symbols to optimize size
+          find universal/lib -type f -name '*.dylib' -exec strip -x {} + 2>/dev/null || true
+          find build-arm64/dist/lib -type f -name '*.dylib' -exec strip -x {} + 2>/dev/null || true
+          find build-x86_64/dist/lib -type f -name '*.dylib' -exec strip -x {} + 2>/dev/null || true
+
           [ -f NOTICE.md ] && cp NOTICE.md universal/ || true
 
       - name: Validate Universal binaries

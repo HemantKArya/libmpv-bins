@@ -93,7 +93,7 @@ jobs:
           set -euo pipefail
           ARCH="${{ matrix.arch }}"
 
-          mkdir -p raw package/bin package/lib package/include
+          mkdir -p raw package/lib package/include
           tar -xf ffmpeg-linux.tar.xz -C raw
 
           echo "=== Extracted root structure ==="
@@ -107,22 +107,20 @@ jobs:
           echo "Package root: $ROOT_DIR"
           find "$ROOT_DIR" -maxdepth 3
 
-          # 1. Binaries
-          if [ -d "$ROOT_DIR/bin" ]; then
-            cp -a "$ROOT_DIR/bin"/* package/bin/
-          fi
-
-          # 2. Shared libraries
+          # 1. Shared libraries (no CLI executables)
           if [ -d "$ROOT_DIR/lib" ]; then
             cp -a "$ROOT_DIR/lib"/* package/lib/
           fi
 
-          # 3. Include headers
+          # Strip unneeded symbols to significantly reduce archive size
+          find package/lib -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+          # 2. Include headers
           if [ -d "$ROOT_DIR/include" ]; then
             cp -r "$ROOT_DIR/include"/* package/include/
           fi
 
-          # 4. Licenses & docs
+          # 3. Licenses & docs
           find "$ROOT_DIR" -maxdepth 2 \( -iname '*license*' -o -iname '*copying*' \) -type f -exec cp {} package/ \; 2>/dev/null || true
           [ -f NOTICE.md ] && cp NOTICE.md package/ || true
           cp source-url.txt package/

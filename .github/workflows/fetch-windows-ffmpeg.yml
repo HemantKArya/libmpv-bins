@@ -109,10 +109,11 @@ jobs:
           echo "Package root: $ROOT_DIR"
           find "$ROOT_DIR" -maxdepth 3
 
-          # 1. Shared DLLs & binaries
+          # 1. Shared DLLs ONLY (strictly exclude .exe executables)
           if [ -d "$ROOT_DIR/bin" ]; then
-            cp -a "$ROOT_DIR/bin"/* package/bin/
+            find "$ROOT_DIR/bin" -maxdepth 1 -name '*.dll' -exec cp -a {} package/bin/ \;
           fi
+          rm -f package/bin/*.exe 2>/dev/null || true
 
           # 2. Libraries & import libs
           if [ -d "$ROOT_DIR/lib" ]; then
@@ -131,6 +132,11 @@ jobs:
 
           # ── Validation ──
           echo "=== Validating package ==="
+          if ls package/bin/*.exe 1>/dev/null 2>&1; then
+            echo "FATAL: Found unexpected .exe in package/bin!"
+            exit 1
+          fi
+
           DLL_COUNT=$(find package/bin -name '*.dll' | wc -l)
           echo "Found DLLs ($DLL_COUNT):"
           find package/bin -name '*.dll'
