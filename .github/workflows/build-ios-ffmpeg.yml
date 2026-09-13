@@ -23,7 +23,16 @@ jobs:
       - name: Install build tools
         run: |
           set -euo pipefail
-          brew install nasm pkg-config
+          brew install nasm yasm pkg-config gnu-tar
+          if ! command -v gas-preprocessor.pl &>/dev/null; then
+            echo "Installing gas-preprocessor.pl..."
+            sudo curl -sSL https://raw.githubusercontent.com/libav/gas-preprocessor/master/gas-preprocessor.pl \
+              -o /opt/homebrew/bin/gas-preprocessor.pl 2>/dev/null || \
+            sudo curl -sSL https://raw.githubusercontent.com/libav/gas-preprocessor/master/gas-preprocessor.pl \
+              -o /usr/local/bin/gas-preprocessor.pl 2>/dev/null || true
+            sudo chmod +x /opt/homebrew/bin/gas-preprocessor.pl 2>/dev/null || \
+            sudo chmod +x /usr/local/bin/gas-preprocessor.pl 2>/dev/null || true
+          fi
 
       - name: Clone kewlbear/FFmpeg-iOS tool branch
         run: |
@@ -36,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Building iOS XCFrameworks via Swift CLI..."
-          swift run ffmpeg-ios build --library avcodec,avformat,avutil,swscale,swresample,avfilter
+          swift run ffmpeg-ios build
 
       - name: Collect and validate XCFrameworks
         run: |
@@ -82,17 +91,24 @@ jobs:
           done
 
           OUTPUT_FILE="ffmpeg-ios-xcframeworks.tar.gz"
+          DEST_PATH="$PWD/${OUTPUT_FILE}"
           cd package
-          find . -print0 | sort -z | \
-            tar --create --null --files-from=- \
-                --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
-                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-            | gzip -9n > "../${OUTPUT_FILE}"
-
+          if command -v gtar &>/dev/null; then
+            find . -print0 | sort -z | \
+              gtar --create --null --files-from=- \
+                  --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                  --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              | gzip -9n > "$DEST_PATH"
+          else
+            tar -czf "$DEST_PATH" .
+          fi
           cd ..
-          echo "Created ${OUTPUT_FILE}:"
           ls -lh "${OUTPUT_FILE}"
-          sha256sum "${OUTPUT_FILE}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${OUTPUT_FILE}"
+          else
+            shasum -a 256 "${OUTPUT_FILE}"
+          fi
 
       - name: Upload iOS FFmpeg artifact
         uses: actions/upload-artifact@v4

@@ -22,7 +22,7 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
-          brew install nasm pkg-config
+          brew install nasm pkg-config gnu-tar
 
       - name: Clone FFmpeg repository
         run: |
@@ -127,15 +127,24 @@ jobs:
           package_dir() {
             local src_dir="$1"
             local tar_name="$2"
+            local dest_path="$PWD/${tar_name}"
             cd "$src_dir"
-            find . -print0 | sort -z | \
-              tar --create --null --files-from=- \
-                  --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
-                  --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-              | gzip -9n > "../../${tar_name}"
-            cd ../..
+            if command -v gtar &>/dev/null; then
+              find . -print0 | sort -z | \
+                gtar --create --null --files-from=- \
+                    --owner=0 --group=0 --mtime='2024-01-01 00:00:00Z' \
+                    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                | gzip -9n > "$dest_path"
+            else
+              tar -czf "$dest_path" .
+            fi
+            cd - > /dev/null
             ls -lh "${tar_name}"
-            sha256sum "${tar_name}"
+            if command -v sha256sum &>/dev/null; then
+              sha256sum "${tar_name}"
+            else
+              shasum -a 256 "${tar_name}"
+            fi
           }
 
           package_dir universal ffmpeg-macos-universal.tar.gz
